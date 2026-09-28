@@ -1,11 +1,13 @@
 //! Human-readable views of the effective settings.
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use crate::config::Settings;
 use crate::config::load::FileStatus;
 use crate::config::model::{Named, SourceClass};
 use crate::config::resolve::KNOBS;
+use crate::engine::store;
 
 fn status_line(label: &str, path: &str, status: &FileStatus) -> String {
     let state = match status {
@@ -114,14 +116,33 @@ pub fn render_check(settings: &Settings) -> (String, bool) {
     (text, valid)
 }
 
+/// One line on the review memory: where it is, how many baselines it holds
+/// and its size.
+pub fn render_memory(root: Option<&Path>) -> String {
+    let Some(root) = root else {
+        return "\nReview memory: no state directory (set HOME or XDG_STATE_HOME)\n".into();
+    };
+    match store::summary(root) {
+        None => format!("\nReview memory: {} (empty)\n", root.display()),
+        Some((baselines, bytes)) => format!(
+            "\nReview memory: {} · {baselines} approved baseline(s) · {} KiB\n",
+            root.display(),
+            bytes / 1024
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{render_check, render_show};
+    use super::{render_check, render_memory, render_show};
+    use crate::agent::SourceFile;
     use crate::config::Settings;
     use crate::config::model::SourceClass;
+    use crate::engine::baseline::{self, Identity, Unit};
+    use crate::engine::store::Store;
     use crate::test_support::TempDir;
 
     #[expect(
@@ -179,5 +200,26 @@ mod tests {
         let (text, valid) = render_check(&Settings::load_from(&system, None, &secure));
         assert!(!valid);
         assert!(text.contains("system.toml:1: profile: expected one of"));
+    }
+
+    #[test]
+    fn memory_summary_counts_baselines() {
+        let state = TempDir::new("show-memory");
+        let root = state.path().join("store");
+        assert!(render_memory(Some(&root)).contains("(empty)"));
+
+        let store = Store::open(root.clone()).unwrap();
+        let unit = Unit {
+            prefix: String::new(),
+            identity: Identity::parse("aur:demo").unwrap(),
+        };
+        let files = [SourceFile {
+            path: "PKGBUILD".into(),
+            content: "x\n".into(),
+        }];
+        baseline::record(&store, SourceClass::Aur, &[unit], &files, 1).unwrap();
+
+        assert!(render_memory(Some(&root)).contains("1 approved baseline(s)"));
+        assert!(render_memory(None).contains("no state directory"));
     }
 }

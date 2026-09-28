@@ -21,10 +21,6 @@ mod classify;
 mod cli;
 mod config;
 mod deps;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the commands in Task 10")
-)]
 mod engine;
 mod error;
 mod json;
