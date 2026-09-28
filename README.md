@@ -210,8 +210,10 @@ targets), Guardian keeps a review memory in
   points whole, and unchanged files only as names in the file list. Local
   rules and the dependency audit still read every file. A baseline only
   counts under the prompt version, model, variant and thinking level that
-  approved it; after any of them changes, the next review is a full one. The
-  `strict` profile turns diff review off.
+  approved it; after any of them changes, the next review is a full one. A
+  source identical to its baseline is sent whole, as a first review, so the
+  cache can answer a repeat of that review. The `strict` profile turns diff
+  review off.
 
 The AUR gate remembers a build by yay's build directory name, and the theme
 handler remembers a theme by its name. Other targets are remembered by their

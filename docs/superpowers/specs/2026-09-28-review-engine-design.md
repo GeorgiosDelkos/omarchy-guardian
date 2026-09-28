@@ -126,7 +126,10 @@ Within a tier, files sort by path so plans are deterministic.
 ### Diff mode
 
 Applies only when the class's `diff` knob is `on`, the target has an
-identity, and a valid baseline exists for it.
+identity, and a valid baseline exists for it. A tree identical to its
+baseline (the same paths with the same content) is planned as a first
+review instead: that is the same request that produced the baseline, so the
+verdict cache can answer it (yay's second `makepkg` pass, for one).
 
 | File | Sent as |
 |---|---|

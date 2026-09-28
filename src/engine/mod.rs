@@ -10,7 +10,7 @@ pub mod plan;
 pub mod request;
 pub mod store;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -117,7 +117,11 @@ pub fn review_group(
     // the store) must hold here too, not only via `Memory::open`.
     let memory = memory.filter(|_| !group.class.is_privileged());
     let mut review = GroupReview::default();
-    let previous = previous_version(memory, group.settings, &mut review.notes);
+    // A tree identical to its approved version is planned as a first review:
+    // the same request that produced the baseline, so the verdict cache can
+    // answer it (an upgrade request would differ and be a new call).
+    let previous = previous_version(memory, group.settings, &mut review.notes)
+        .filter(|previous| !is_identical(previous, group.files));
     let flagged: BTreeSet<String> = group
         .findings
         .iter()
@@ -219,6 +223,20 @@ fn previous_version(
             None
         }
     }
+}
+
+/// Whether `files` are exactly the approved version: the same paths with
+/// the same content.
+fn is_identical(previous: &Previous, files: &[SourceFile]) -> bool {
+    let current: BTreeMap<&str, &str> = files
+        .iter()
+        .map(|file| (file.path.as_str(), file.content.as_str()))
+        .collect();
+    current.len() == files.len()
+        && current.len() == previous.len()
+        && previous
+            .iter()
+            .all(|(path, content)| current.get(path.as_str()) == Some(&content.as_str()))
 }
 
 fn upgrade_note(manifest: &[ManifestEntry]) -> String {
@@ -590,6 +608,37 @@ mod tests {
         assert!(sent.contains(r#""path":"src/lib.c","kind":"diff""#));
         assert!(sent.contains(r#""path":"PKGBUILD","kind":"whole""#));
         assert!(sent.contains("-int value_20 = 20;"));
+    }
+
+    #[test]
+    fn an_unchanged_tree_is_a_first_review_answered_from_the_cache() {
+        let state = TempDir::new("engine-unchanged");
+        let bin = TempDir::new("engine-unchanged-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let memory = memory(&state, units("aur:demo"));
+        let settings = AgentSettings::default();
+        let files = [
+            file("PKGBUILD", "pkgname=demo\n"),
+            file("src/lib.c", "int a;\n"),
+        ];
+
+        let first = review_group(&group(&settings, &files), &opencode, Some(&memory));
+        assert!(matches!(first.runs.as_slice(), [run] if run.cached.is_none()));
+        assert!(remember(&memory, Some((&files, &settings))).is_empty());
+        fs::remove_file(bin.path().join("stdin")).unwrap();
+
+        let second = review_group(&group(&settings, &files), &opencode, Some(&memory));
+
+        assert!(
+            !second.notes.iter().any(|note| note.contains("upgrade")),
+            "{:?}",
+            second.notes
+        );
+        assert!(matches!(
+            second.runs.as_slice(),
+            [run] if run.cached.as_deref().is_some_and(|note| note.starts_with("from cache"))
+        ));
+        assert!(!bin.path().join("stdin").exists());
     }
 
     #[test]

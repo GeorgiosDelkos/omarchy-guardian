@@ -684,16 +684,19 @@ mod tests {
             first.decide(&|class| settings.policy(class)),
             Decision::Clear
         );
-        // The first review recorded a baseline, so the second is reviewed as
-        // an upgrade (a new request); the third repeats the second exactly.
-        review_tree(&ScanConfig::new(dir.path()), &context);
-        let third = review_tree(&ScanConfig::new(dir.path()), &context);
+        // The first review recorded a baseline; the unchanged tree is planned
+        // as the same first-review request, so the cache answers it.
+        let second = review_tree(&ScanConfig::new(dir.path()), &context);
 
-        assert!(!third.agent_runs.is_empty());
+        assert!(!second.agent_runs.is_empty());
         assert!(
-            third.agent_runs.iter().all(|run| run.cached.is_some()),
+            second.agent_runs.iter().all(|run| run.cached.is_some()),
             "{:?}",
-            third.agent_runs
+            second.agent_runs
+        );
+        assert_eq!(
+            second.decide(&|class| settings.policy(class)),
+            Decision::Clear
         );
     }
 

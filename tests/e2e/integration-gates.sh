@@ -392,11 +392,9 @@ engine_gate() {
     expect 'first engine review is clear' 0 "$?"
     expect_mock_run 'makepkg ran after the first review' 'makepkg --noconfirm'
 
-    # The first clear review became the approved baseline: the second run is
-    # reviewed as an upgrade, and the third repeats the second exactly.
-    run_shim "$dir" --noconfirm >"$output" 2>&1
-    expect 'second engine review is clear' 0 "$?"
-    expect_mock_run 'makepkg ran after the second review' 'makepkg --noconfirm'
+    # The first clear review became the approved baseline; an unchanged tree
+    # is sent as the same first-review request, so the second run (like
+    # yay's second makepkg pass) is answered from the cache.
     run_shim "$dir" --noconfirm >"$output" 2>&1
     expect 'an unchanged rerun is clear' 0 "$?"
     expect_output 'an unchanged rerun comes from the cache' 'from cache' "$output"
