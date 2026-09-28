@@ -292,7 +292,14 @@ impl Report {
                             if run.files.contains(&finding.file) {
                                 vec![self.class_of(&finding.file)]
                             } else {
-                                classes.clone()
+                                // Every chunk sees the whole manifest, so a
+                                // finding may name a file outside this run.
+                                // Apply both the run's own classes and the
+                                // named file's class: the strictest of the
+                                // two must decide, never only the looser.
+                                let mut named = classes.clone();
+                                named.push(self.class_of(&finding.file));
+                                named
                             }
                         })
                         .collect();
@@ -839,6 +846,48 @@ mod tests {
         assert_eq!(mixed.decide(&warn_official), Decision::Warned);
         assert_eq!(
             mixed.decide(&standard),
+            Decision::Blocked(Blocked::Findings)
+        );
+    }
+
+    #[test]
+    fn a_finding_naming_another_chunks_file_applies_that_files_class_too() {
+        let mut mixed = report(SourceClass::ThirdPartyRepo);
+        mixed
+            .file_classes
+            .insert("core-pkg/.INSTALL".into(), SourceClass::Official);
+        mixed
+            .file_classes
+            .insert("chaotic-pkg/.INSTALL".into(), SourceClass::ThirdPartyRepo);
+
+        // This run's own files are only the third-party one; a chunk sees
+        // the whole manifest, so its finding can still name a file that
+        // belongs to a different chunk (and class) entirely.
+        let mut run = reviewed(Status::Suspicious, &["chaotic-pkg/.INSTALL"]);
+        if let AgentOutcome::Reviewed(review) = &mut run.outcome {
+            review.findings.push(AgentFinding {
+                severity: Severity::Medium,
+                file: "core-pkg/.INSTALL".into(),
+                line: None,
+                title: "t".into(),
+                reason: "r".into(),
+            });
+        }
+        mixed.agent_runs.push(run);
+
+        // Third-party (the run's own class) is lenient here; official (the
+        // named file's own class) keeps standard's block. Both classes'
+        // policies must be applied, so the named file's stricter class
+        // still blocks even though the run's own class would only warn.
+        let lenient_third_party = |class| {
+            let mut policy = standard(class);
+            if class == SourceClass::ThirdPartyRepo {
+                policy.on_ai_suspicious = crate::config::model::Action::Warn;
+            }
+            policy
+        };
+        assert_eq!(
+            mixed.decide(&lenient_third_party),
             Decision::Blocked(Blocked::Findings)
         );
     }
