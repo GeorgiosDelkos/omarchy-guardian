@@ -346,11 +346,13 @@ fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
 fn parse_forget(args: &[OsString]) -> Result<Forget, String> {
     match args {
         [arg] if arg == "--all" => Ok(Forget::All),
-        [arg] => arg
-            .to_str()
-            .ok_or_else(|| "the identity must be UTF-8".to_string())
-            .and_then(Identity::parse)
-            .map(Forget::One),
+        [arg] => match arg.to_str() {
+            Some(text) if text.starts_with('-') => Err(format!(
+                "unknown option {text:?}; forget takes one identity or --all"
+            )),
+            Some(text) => Identity::parse(text).map(Forget::One),
+            None => Err("the identity must be UTF-8".to_string()),
+        },
         _ => Err("forget takes one identity or --all".into()),
     }
 }
@@ -1011,6 +1013,8 @@ mod tests {
         );
         assert!(parse(&args(&["forget"])).is_err());
         assert!(parse(&args(&["forget", "a", "b"])).is_err());
+        assert!(parse(&args(&["forget", "--al"])).is_err());
+        assert!(parse(&args(&["forget", "-x"])).is_err());
     }
 
     #[test]
