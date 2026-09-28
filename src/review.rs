@@ -35,7 +35,7 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
         .settings
         .agent_settings(context.class)
         .max_input_bytes;
-    report.agent_disabled = context.settings.policy(context.class).ai == AiRequirement::Off;
+    report.ai_off_classes = ai_off_classes(context.settings, &[context.class]);
 
     let (snapshot, walk_gaps) = scan::walk(config, &mut |file: TextFile<'_>| {
         analyze_text(&mut report, file.rel, file.text, true);
@@ -49,6 +49,15 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
     audit_dependencies(&mut report);
     run_agents(&mut report, context.settings, context.opencode);
     report
+}
+
+/// The subset of `classes` whose resolved policy has `ai = off`.
+pub fn ai_off_classes(settings: &Settings, classes: &[SourceClass]) -> Vec<SourceClass> {
+    classes
+        .iter()
+        .copied()
+        .filter(|class| settings.policy(*class).ai == AiRequirement::Off)
+        .collect()
 }
 
 /// Applies the local checks to one text file and queues it for the AI review.
@@ -81,7 +90,7 @@ pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependen
 }
 
 fn queue_for_agent(report: &mut Report, rel: &str, text: &str) {
-    if report.agent_disabled {
+    if report.ai_off_classes.contains(&report.class_of(rel)) {
         return;
     }
     if rules::is_sensitive_path(rel) {
@@ -197,11 +206,11 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{ReviewContext, analyze_text, review_tree, run_agents};
+    use super::{ReviewContext, ai_off_classes, analyze_text, review_tree, run_agents};
     use crate::agent::Status;
     use crate::config::Settings;
-    use crate::config::file::{AgentDefaults, PartialConfig};
-    use crate::config::model::{Profile, SourceClass, builtin};
+    use crate::config::file::{AgentDefaults, PartialConfig, PartialPolicy};
+    use crate::config::model::{AiRequirement, Profile, SourceClass, builtin};
     use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Gap, Report};
     use crate::rules::RuleId;
     use crate::scan::ScanConfig;
@@ -501,5 +510,54 @@ mod tests {
             report.decide(&|class| settings.policy(class)),
             Decision::Clear
         );
+    }
+
+    #[test]
+    fn ai_off_classes_in_a_mixed_report_are_not_queued() {
+        let system = PartialConfig {
+            classes: vec![(
+                SourceClass::Official,
+                PartialPolicy {
+                    ai: Some(AiRequirement::Off),
+                    ..PartialPolicy::default()
+                },
+            )],
+            ..PartialConfig::default()
+        };
+        let settings = Settings::from_parts(system, PartialConfig::default());
+
+        let mut report = Report::new("transaction");
+        report.class = SourceClass::ThirdPartyRepo;
+        report.agent_input_limit = 16 * 1024;
+        report.ai_off_classes = ai_off_classes(
+            &settings,
+            &[SourceClass::Official, SourceClass::ThirdPartyRepo],
+        );
+        assert_eq!(report.ai_off_classes, [SourceClass::Official]);
+
+        report
+            .file_classes
+            .insert("core/a/.INSTALL".into(), SourceClass::Official);
+        analyze_text(
+            &mut report,
+            "core/a/.INSTALL",
+            &"a".repeat(40 * 1024),
+            false,
+        );
+        analyze_text(
+            &mut report,
+            "chaotic/b/.INSTALL",
+            "post_install() { true; }\n",
+            false,
+        );
+
+        let queued: Vec<&str> = report
+            .agent_input
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(queued, ["chaotic/b/.INSTALL"]);
+        assert!(!report.agent_input_overflowed);
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
     }
 }

@@ -30,6 +30,13 @@ const TOOL_LIMITS: Limits = Limits {
 };
 const C_LOCALE: &[(&str, &str)] = &[("LC_ALL", "C")];
 
+/// Every class a transaction target can resolve to.
+const PRIVILEGED: [SourceClass; 3] = [
+    SourceClass::Official,
+    SourceClass::ThirdPartyRepo,
+    SourceClass::LocalPackage,
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HookArgs {
     pub pacman_pid: u32,
@@ -60,6 +67,7 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
     report.class = SourceClass::ThirdPartyRepo;
     report.profile = settings.system_profile().name().to_string();
     report.agent_input_limit = privileged_agent_input_limit(settings);
+    report.ai_off_classes = review::ai_off_classes(settings, &PRIVILEGED);
 
     let (archives, classes) = match operation {
         Operation::Sync => sync_archives(&targets, settings)?,
@@ -77,10 +85,8 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
         match archives.get(target) {
             Some(Ok(paths)) => {
                 for archive in paths {
-                    match scan_install_script(archive, target, &mut report) {
-                        Ok(Some(rel)) => {
-                            report.file_classes.insert(rel, class);
-                        }
+                    match scan_install_script(archive, target, class, &mut report) {
+                        Ok(Some(_)) => {}
                         Ok(None) => {
                             println!("Pacman package {target}: no install scriptlet to review.");
                         }
@@ -106,15 +112,11 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
 /// classes a target can resolve to: this is how a system-file
 /// `[agent] max_input_kib` takes effect in the hook.
 fn privileged_agent_input_limit(settings: &Settings) -> usize {
-    [
-        SourceClass::Official,
-        SourceClass::ThirdPartyRepo,
-        SourceClass::LocalPackage,
-    ]
-    .into_iter()
-    .map(|class| settings.agent_settings(class).max_input_bytes)
-    .max()
-    .unwrap_or(DEFAULT_MAX_INPUT_KIB as usize * 1024)
+    PRIVILEGED
+        .into_iter()
+        .map(|class| settings.agent_settings(class).max_input_bytes)
+        .max()
+        .unwrap_or(DEFAULT_MAX_INPUT_KIB as usize * 1024)
 }
 
 fn read_targets(input: impl BufRead) -> Result<Vec<String>, Error> {
@@ -441,9 +443,12 @@ fn package_name(archive: &Path) -> Result<String, Error> {
 /// Extracts `.INSTALL` directly (no listing, which is unbounded for packages
 /// with many files). Returns the virtual path it was reviewed under, or
 /// `None` when the archive had no scriptlet.
+/// Tags the scriptlet with `class` before analyzing it, because whether it
+/// is queued for the AI review depends on its class.
 pub fn scan_install_script(
     archive: &Path,
     target: &str,
+    class: SourceClass,
     report: &mut Report,
 ) -> Result<Option<String>, Error> {
     let captured = tools::run(
@@ -477,6 +482,7 @@ pub fn scan_install_script(
         .and_then(|name| name.to_str())
         .unwrap_or("package");
     let rel = format!("{target}/{archive_name}/.INSTALL");
+    report.file_classes.insert(rel.clone(), class);
     review::analyze_text(report, &rel, &contents, false);
     Ok(Some(rel))
 }
@@ -708,10 +714,14 @@ mod tests {
 
         let mut report = Report::new("test");
         assert_eq!(
-            scan_install_script(&archive, "sample", &mut report)
+            scan_install_script(&archive, "sample", SourceClass::LocalPackage, &mut report)
                 .unwrap()
                 .as_deref(),
             Some("sample/sample-1.0-1-any.pkg.tar/.INSTALL")
+        );
+        assert_eq!(
+            report.class_of("sample/sample-1.0-1-any.pkg.tar/.INSTALL"),
+            SourceClass::LocalPackage
         );
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].rule, RuleId::DestructiveSystemOperation);
@@ -724,7 +734,13 @@ mod tests {
         let plain_dir = TempDir::new("pacman-plain");
         let plain = build_package(plain_dir.path(), None);
         assert_eq!(
-            scan_install_script(&plain, "sample", &mut Report::default()).unwrap(),
+            scan_install_script(
+                &plain,
+                "sample",
+                SourceClass::LocalPackage,
+                &mut Report::default()
+            )
+            .unwrap(),
             None
         );
     }

@@ -183,9 +183,11 @@ pub struct Report {
     /// The bytes budget an AI review may be given, from the target class's
     /// agent settings.
     pub agent_input_limit: usize,
-    /// Set when the target class's policy has `ai = off`: nothing is queued
-    /// for the AI provider, so AI-input gaps do not apply either.
-    pub agent_disabled: bool,
+    /// Classes whose policy has `ai = off`: their files are never queued for
+    /// the AI provider, so AI-input gaps do not apply to them either. Files
+    /// are matched through `class_of`, so `file_classes` must be set before
+    /// a file is analyzed.
+    pub ai_off_classes: Vec<SourceClass>,
     pub dependencies: Inventory,
     pub audit: Option<Audit>,
     /// Class of every file not listed in `file_classes`.
