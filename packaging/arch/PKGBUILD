@@ -1,0 +1,55 @@
+# Builds omarchy-guardian from this source checkout:
+#   cd packaging/arch && makepkg -si
+# Installing the package activates nothing; run
+#   sudo /usr/lib/omarchy-guardian/enable-system-hook.sh
+# to turn on the pacman hook and the theme interceptor.
+
+pkgname=omarchy-guardian
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Reviews downloaded source, AUR builds, pacman scriptlets and Omarchy themes before they run'
+arch=('x86_64' 'aarch64')
+url='https://github.com/gosumarchy/omarchy-guardian'
+license=('unknown')
+depends=('bubblewrap' 'coreutils' 'curl' 'git' 'glibc' 'libarchive' 'pacman' 'util-linux')
+makedepends=('cargo')
+optdepends=('opencode: AI source review; without it no review can come out clear')
+install=omarchy-guardian.install
+
+_root="$startdir/../.."
+
+prepare() {
+    cd "$_root"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+    cd "$_root"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo build --frozen --release
+}
+
+check() {
+    cd "$_root"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo test --frozen --release
+}
+
+package() {
+    cd "$_root"
+    local lib="$pkgdir/usr/lib/omarchy-guardian"
+
+    install -Dm755 "$srcdir/target/release/omarchy-guardian" "$pkgdir/usr/bin/omarchy-guardian"
+    install -Dm755 integrations/pacman/guardian-pacman-hook "$lib/guardian-pacman-hook"
+    install -Dm755 integrations/yay/guardian-makepkg "$lib/guardian-makepkg"
+    install -Dm755 integrations/omarchy/guardian-theme "$lib/guardian-theme"
+    install -Dm644 integrations/omarchy/omarchy-bash-interceptor.sh "$lib/omarchy-bash-interceptor.sh"
+    install -Dm755 integrations/omarchy/install-user-interceptor.sh "$lib/install-user-interceptor.sh"
+    install -Dm755 integrations/enable-system-hook.sh "$lib/enable-system-hook.sh"
+    install -Dm644 integrations/pacman/omarchy-guardian.hook \
+        "$pkgdir/usr/share/omarchy-guardian/omarchy-guardian.hook"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/omarchy-guardian/README.md"
+}

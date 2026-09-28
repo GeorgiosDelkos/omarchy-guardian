@@ -1,0 +1,466 @@
+//! Walking a source tree and hashing what is in it.
+//!
+//! The walk never follows symbolic links, including ones swapped in while it
+//! runs. Each directory is opened, checked against the `lstat` taken before
+//! opening it, and then read through its `/proc/self/fd/N` handle, so children
+//! are looked up in the directory that was verified rather than by
+//! re-resolving a path an attacker could change. Every opened file gets the
+//! same device/inode check.
+
+use std::ffi::OsString;
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{self, Read};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+
+use crate::error::Error;
+use crate::report::Gap;
+use crate::sha256::{Digest, Sha256};
+
+pub const MAX_TEXT_FILE_SIZE: u64 = 2 * 1024 * 1024;
+pub const MAX_HASHED_FILE_SIZE: u64 = 512 * 1024 * 1024;
+const BINARY_PROBE_SIZE: usize = 8192;
+
+/// Directories skipped unless the scan is thorough. `.git` is always skipped.
+const IGNORED_DIRS: &[&str] = &["target", "node_modules", ".venv", "vendor", "dist", "build"];
+
+/// `O_NONBLOCK` in the Linux generic ABI (`x86_64`, `aarch64`, `arm`, `riscv64`). A path
+/// swapped for a FIFO between `lstat` and `open` then fails the identity check
+/// instead of blocking the open; it has no effect on regular files.
+const O_NONBLOCK: i32 = 0o4000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanConfig {
+    pub root: PathBuf,
+    pub include_ignored_dirs: bool,
+    /// Top-level directory names left out of both the review and the snapshot.
+    pub excluded_top_level: Vec<String>,
+}
+
+impl ScanConfig {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            include_ignored_dirs: false,
+            excluded_top_level: Vec::new(),
+        }
+    }
+
+    fn skips(&self, name: &str, top_level: bool) -> bool {
+        name == ".git"
+            || (!self.include_ignored_dirs && IGNORED_DIRS.contains(&name))
+            || (top_level
+                && self
+                    .excluded_top_level
+                    .iter()
+                    .any(|excluded| excluded == name))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileKind {
+    /// UTF-8 text within the review size limit.
+    Text,
+    /// Hashed but not reviewed.
+    Binary,
+    /// Text too large to review; makes the scan incomplete.
+    OversizedText,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileHash {
+    /// Path relative to the scan root, `/`-separated.
+    pub path: String,
+    pub sha256: Digest,
+    pub kind: FileKind,
+}
+
+/// The files of a tree, sorted by path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    files: Vec<FileHash>,
+}
+
+impl Snapshot {
+    fn from_files(mut files: Vec<FileHash>) -> Self {
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Self { files }
+    }
+
+    pub fn files(&self) -> &[FileHash] {
+        &self.files
+    }
+
+    pub fn count(&self, kind: FileKind) -> usize {
+        self.files.iter().filter(|file| file.kind == kind).count()
+    }
+
+    /// One digest over the whole manifest: path, NUL, hex digest and a
+    /// reviewed-text flag per file.
+    pub fn manifest_digest(&self) -> Digest {
+        let mut hasher = Sha256::new();
+        for file in &self.files {
+            hasher.update(file.path.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(file.sha256.to_string().as_bytes());
+            hasher.update(&[u8::from(file.kind == FileKind::Text)]);
+            hasher.update(b"\n");
+        }
+        hasher.finalize()
+    }
+}
+
+/// A reviewable text file found by the walk.
+pub struct TextFile<'a> {
+    pub rel: &'a str,
+    pub text: &'a str,
+}
+
+/// Walks the tree, calling `on_text` for each reviewable text file. Returns
+/// the snapshot of every file found and the reasons the walk was incomplete.
+pub fn walk(config: &ScanConfig, on_text: &mut dyn FnMut(TextFile<'_>)) -> (Snapshot, Vec<Gap>) {
+    let mut walker = Walker {
+        config,
+        on_text,
+        files: Vec::new(),
+        gaps: Vec::new(),
+    };
+
+    let root = &config.root;
+    let rel = if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
+        String::new()
+    } else {
+        root.file_name().map_or_else(
+            || root.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    };
+    walker.entry(root, root, rel);
+
+    (Snapshot::from_files(walker.files), walker.gaps)
+}
+
+/// Re-walks the tree and requires it to match `expected` exactly.
+pub fn verify_unchanged(config: &ScanConfig, expected: &Snapshot) -> Result<(), Error> {
+    let (current, gaps) = walk(config, &mut |_| {});
+    if !gaps.is_empty() {
+        return Err(Error::Refused(
+            "the source tree changed or became unreadable after review".into(),
+        ));
+    }
+    if current != *expected {
+        return Err(Error::Refused(
+            "the scanned file set or file contents changed after review".into(),
+        ));
+    }
+    Ok(())
+}
+
+struct Walker<'a> {
+    config: &'a ScanConfig,
+    on_text: &'a mut dyn FnMut(TextFile<'_>),
+    files: Vec<FileHash>,
+    gaps: Vec<Gap>,
+}
+
+impl Walker<'_> {
+    fn io_gap(&mut self, logical: &Path, source: io::Error) {
+        self.gaps.push(Gap::Io(Error::Io {
+            path: logical.to_path_buf(),
+            source,
+        }));
+    }
+
+    /// Visits one entry. `access` is the path used to reach it (under a
+    /// verified directory handle); `logical` is the path shown to the user.
+    fn entry(&mut self, access: &Path, logical: &Path, rel: String) {
+        let metadata = match fs::symlink_metadata(access) {
+            Ok(metadata) => metadata,
+            Err(error) => return self.io_gap(logical, error),
+        };
+        let file_type = metadata.file_type();
+        let shown = logical.display().to_string();
+
+        if file_type.is_symlink() {
+            self.gaps.push(Gap::Symlink(shown));
+        } else if file_type.is_dir() {
+            match open_verified(access, &metadata) {
+                Ok(directory) => self.directory(&directory, logical, &rel),
+                Err(error) => self.io_gap(logical, error),
+            }
+        } else if file_type.is_file() {
+            match open_verified(access, &metadata) {
+                Ok(file) => self.file(file, &metadata, logical, rel),
+                Err(error) => self.io_gap(logical, error),
+            }
+        } else {
+            self.gaps.push(Gap::SpecialFile(shown));
+        }
+    }
+
+    fn directory(&mut self, directory: &File, logical: &Path, rel: &str) {
+        let handle = fd_path(directory);
+        let listing = match fs::read_dir(&handle) {
+            Ok(listing) => listing,
+            Err(error) => return self.io_gap(logical, error),
+        };
+
+        let mut names: Vec<OsString> = Vec::new();
+        for entry in listing {
+            match entry {
+                Ok(entry) => names.push(entry.file_name()),
+                Err(error) => self.io_gap(logical, error),
+            }
+        }
+        names.sort();
+
+        for name in names {
+            let child_logical = logical.join(&name);
+            let Some(name_text) = name.to_str() else {
+                self.gaps
+                    .push(Gap::NonUtf8Name(child_logical.display().to_string()));
+                continue;
+            };
+            if self.config.skips(name_text, rel.is_empty()) {
+                continue;
+            }
+
+            let child_rel = if rel.is_empty() {
+                name_text.to_string()
+            } else {
+                format!("{rel}/{name_text}")
+            };
+            self.entry(&handle.join(&name), &child_logical, child_rel);
+        }
+    }
+
+    fn file(&mut self, mut file: File, metadata: &Metadata, logical: &Path, rel: String) {
+        if metadata.len() > MAX_HASHED_FILE_SIZE {
+            self.gaps
+                .push(Gap::HashLimit(logical.display().to_string()));
+            return;
+        }
+
+        let (sha256, contents) = match read_classified(&mut file) {
+            Ok(result) => result,
+            Err(error) => return self.io_gap(logical, error),
+        };
+        let kind = match &contents {
+            Contents::Text(text) => {
+                (self.on_text)(TextFile { rel: &rel, text });
+                FileKind::Text
+            }
+            Contents::Binary => FileKind::Binary,
+            Contents::OversizedText => {
+                self.gaps.push(Gap::OversizedText(rel.clone()));
+                FileKind::OversizedText
+            }
+        };
+        self.files.push(FileHash {
+            path: rel,
+            sha256,
+            kind,
+        });
+    }
+}
+
+fn fd_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Opens `access` and checks it is still the object `expected` describes.
+fn open_verified(access: &Path, expected: &Metadata) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(access)?;
+    let opened = file.metadata()?;
+    if opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+        return Err(io::Error::other("changed while it was being scanned"));
+    }
+    Ok(file)
+}
+
+enum Contents {
+    Text(String),
+    Binary,
+    OversizedText,
+}
+
+/// Hashes the whole file and keeps its text when it is small enough to
+/// review. Larger files are classified from their first bytes and streamed.
+fn read_classified(file: &mut File) -> io::Result<(Digest, Contents)> {
+    let mut hasher = Sha256::new();
+    let mut head = Vec::new();
+    file.by_ref()
+        .take(MAX_TEXT_FILE_SIZE + 1)
+        .read_to_end(&mut head)?;
+    hasher.update(&head);
+
+    if head.len() as u64 <= MAX_TEXT_FILE_SIZE {
+        let digest = hasher.finalize();
+        let contents = match String::from_utf8(head) {
+            Ok(text) if !text.contains('\0') => Contents::Text(text),
+            Ok(_) | Err(_) => Contents::Binary,
+        };
+        return Ok((digest, contents));
+    }
+
+    let contents = if looks_binary(&head[..BINARY_PROBE_SIZE]) {
+        Contents::Binary
+    } else {
+        Contents::OversizedText
+    };
+
+    let mut total = head.len() as u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        if total > MAX_HASHED_FILE_SIZE {
+            return Err(io::Error::other("file grew past the integrity-hash limit"));
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok((hasher.finalize(), contents))
+}
+
+/// NUL bytes or invalid UTF-8 in a prefix. A multi-byte character cut off at
+/// the end of the prefix does not count.
+fn looks_binary(prefix: &[u8]) -> bool {
+    prefix.contains(&0)
+        || std::str::from_utf8(prefix)
+            .err()
+            .is_some_and(|error| error.error_len().is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    use super::{FileKind, MAX_TEXT_FILE_SIZE, ScanConfig, verify_unchanged, walk};
+    use crate::report::Gap;
+    use crate::test_support::TempDir;
+
+    fn walk_texts(config: &ScanConfig) -> (Vec<String>, super::Snapshot, Vec<Gap>) {
+        let mut texts = Vec::new();
+        let (snapshot, gaps) = walk(config, &mut |file| texts.push(file.rel.to_string()));
+        (texts, snapshot, gaps)
+    }
+
+    #[test]
+    fn hashes_files_and_detects_post_review_changes() {
+        let dir = TempDir::new("snapshot");
+        let source = dir.path().join("main.rs");
+        fs::write(&source, "fn main() {}\n").unwrap();
+        let config = ScanConfig::new(dir.path());
+
+        let (texts, snapshot, gaps) = walk_texts(&config);
+        assert_eq!(texts, ["main.rs"]);
+        assert!(gaps.is_empty());
+        assert_eq!(snapshot.files().len(), 1);
+        assert!(verify_unchanged(&config, &snapshot).is_ok());
+
+        fs::write(&source, "fn main() { println!(\"changed\"); }\n").unwrap();
+        assert!(verify_unchanged(&config, &snapshot).is_err());
+    }
+
+    #[test]
+    fn skips_git_and_generated_directories_unless_thorough() {
+        let dir = TempDir::new("ignored");
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/theme")).unwrap();
+        fs::write(dir.path().join(".git/config"), "x\n").unwrap();
+        fs::write(dir.path().join("vendor/theme/payload.lua"), "x\n").unwrap();
+
+        let mut config = ScanConfig::new(dir.path());
+        assert!(walk_texts(&config).0.is_empty());
+
+        config.include_ignored_dirs = true;
+        assert_eq!(walk_texts(&config).0, ["vendor/theme/payload.lua"]);
+    }
+
+    #[test]
+    fn excludes_only_top_level_directories() {
+        let dir = TempDir::new("excluded");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join("lib/src")).unwrap();
+        fs::write(dir.path().join("src/a.c"), "x\n").unwrap();
+        fs::write(dir.path().join("lib/src/b.c"), "x\n").unwrap();
+        fs::write(dir.path().join("PKGBUILD"), "x\n").unwrap();
+
+        let mut config = ScanConfig::new(dir.path());
+        config.excluded_top_level = vec!["src".to_string()];
+        assert_eq!(walk_texts(&config).0, ["PKGBUILD", "lib/src/b.c"]);
+    }
+
+    #[test]
+    fn refuses_symlinks_and_non_utf8_names() {
+        let dir = TempDir::new("links");
+        fs::write(dir.path().join("real.rs"), "x\n").unwrap();
+        symlink(dir.path().join("real.rs"), dir.path().join("link.rs")).unwrap();
+        fs::write(dir.path().join(OsStr::from_bytes(b"bad-\xff.txt")), "x\n").unwrap();
+
+        let (_, _, gaps) = walk_texts(&ScanConfig::new(dir.path()));
+        assert!(gaps.iter().any(|gap| matches!(gap, Gap::Symlink(_))));
+        assert!(gaps.iter().any(|gap| matches!(gap, Gap::NonUtf8Name(_))));
+    }
+
+    #[test]
+    fn a_symlinked_root_is_refused() {
+        let dir = TempDir::new("root-link");
+        fs::create_dir(dir.path().join("real")).unwrap();
+        symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+
+        let (_, _, gaps) = walk_texts(&ScanConfig::new(dir.path().join("link")));
+        assert!(matches!(gaps.as_slice(), [Gap::Symlink(_)]));
+    }
+
+    #[test]
+    fn classifies_large_binary_and_large_text_files() {
+        let dir = TempDir::new("large");
+        let size = usize::try_from(MAX_TEXT_FILE_SIZE).unwrap() + 1;
+
+        let mut image = vec![0_u8; size];
+        image[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        fs::write(dir.path().join("background.png"), image).unwrap();
+        fs::write(dir.path().join("huge.txt"), "a".repeat(size)).unwrap();
+
+        let (texts, snapshot, gaps) = walk_texts(&ScanConfig::new(dir.path()));
+        assert!(texts.is_empty());
+        assert_eq!(snapshot.count(FileKind::Binary), 1);
+        assert_eq!(snapshot.count(FileKind::OversizedText), 1);
+        assert!(matches!(gaps.as_slice(), [Gap::OversizedText(path)] if path == "huge.txt"));
+    }
+
+    #[test]
+    fn a_single_file_root_uses_its_name() {
+        let dir = TempDir::new("single");
+        let file = dir.path().join("install.sh");
+        fs::write(&file, "echo hi\n").unwrap();
+
+        let (texts, snapshot, gaps) = walk_texts(&ScanConfig::new(&file));
+        assert_eq!(texts, ["install.sh"]);
+        assert_eq!(snapshot.files()[0].path, "install.sh");
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn manifest_digest_depends_on_paths_and_contents() {
+        let dir = TempDir::new("manifest");
+        fs::write(dir.path().join("a"), "1").unwrap();
+        let config = ScanConfig::new(dir.path());
+        let first = walk_texts(&config).1.manifest_digest();
+
+        fs::write(dir.path().join("a"), "2").unwrap();
+        let second = walk_texts(&config).1.manifest_digest();
+        assert_ne!(first, second);
+    }
+}

@@ -7,6 +7,6 @@ Target = *
 [Action]
 Description = Review package install scripts with Omarchy Guardian
 When = PreTransaction
-Exec = /usr/local/lib/omarchy-guardian/guardian-pacman-hook
+Exec = /usr/lib/omarchy-guardian/guardian-pacman-hook
 AbortOnFail
 NeedsTargets

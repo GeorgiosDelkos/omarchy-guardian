@@ -1,0 +1,16 @@
+post_install() {
+    printf '%s\n' \
+        "omarchy-guardian is installed but not active." \
+        "Enable the pacman hook and theme interception with:" \
+        "  sudo /usr/lib/omarchy-guardian/enable-system-hook.sh" \
+        "Enable the AUR gate with:" \
+        "  yay --makepkg /usr/lib/omarchy-guardian/guardian-makepkg --save -P --stats"
+}
+
+pre_remove() {
+    if [ -L /etc/pacman.d/hooks/omarchy-guardian.hook ]; then
+        rm -f /etc/pacman.d/hooks/omarchy-guardian.hook
+        printf '%s\n' "Removed the Guardian pacman hook." \
+            "Restore yay with: yay --makepkg /usr/bin/makepkg --save -P --stats"
+    fi
+}

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-GUARDIAN=/usr/local/bin/omarchy-guardian
+GUARDIAN=/usr/bin/omarchy-guardian
 REAL_MAKEPKG=/usr/bin/makepkg
 
 if [ ! -x "$GUARDIAN" ]; then
@@ -14,4 +14,8 @@ if [ ! -f PKGBUILD ]; then
     exit 2
 fi
 
-exec "$GUARDIAN" guard --thorough "$(pwd -P)" -- "$REAL_MAKEPKG" "$@"
+# yay calls makepkg several times per package. After the first call, makepkg's
+# own src/ and pkg/ work directories hold extracted upstream sources and build
+# output rather than AUR inputs, so they are left out of the review and the
+# snapshot; the PKGBUILD, install scripts and patches are still reviewed.
+exec "$GUARDIAN" guard --thorough --exclude src --exclude pkg "$(pwd -P)" -- "$REAL_MAKEPKG" "$@"

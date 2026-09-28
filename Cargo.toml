@@ -1,10 +1,43 @@
 [package]
 name = "omarchy-guardian"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Reviews downloaded source, AUR builds, pacman scriptlets and Omarchy themes before they run"
+publish = false
 
+# Deliberately empty: Guardian is a security gate, so every line of parsing and
+# hashing it relies on lives in this crate where it can be audited.
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-toml = "0.8"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_qualifications = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panic prevention
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+# No cheating
+allow_attributes = "deny"
+# Code hygiene
+dbg_macro = "deny"
+todo = "deny"
+exit = "deny"
+mem_forget = "deny"
+# Terminal output is the product of this CLI.
+print_stdout = "allow"
+print_stderr = "allow"
+# Pedantic relaxations (too noisy)
+module_name_repetitions = "allow"
+similar_names = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

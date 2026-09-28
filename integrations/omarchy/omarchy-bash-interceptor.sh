@@ -14,14 +14,14 @@ omarchy() {
             return
         fi
         shift 2
-        /usr/local/lib/omarchy-guardian/guardian-theme install "$@"
+        /usr/lib/omarchy-guardian/guardian-theme install "$@"
     elif [[ ${1-} == theme && ${2-} == update ]]; then
         if _omarchy_guardian_help_requested "$@"; then
             command /usr/share/omarchy/bin/omarchy "$@"
             return
         fi
         shift 2
-        /usr/local/lib/omarchy-guardian/guardian-theme update "$@"
+        /usr/lib/omarchy-guardian/guardian-theme update "$@"
     else
         command /usr/share/omarchy/bin/omarchy "$@"
     fi
@@ -32,7 +32,7 @@ omarchy-theme-install() {
         command /usr/share/omarchy/bin/omarchy theme install --help
         return
     fi
-    /usr/local/lib/omarchy-guardian/guardian-theme install "$@"
+    /usr/lib/omarchy-guardian/guardian-theme install "$@"
 }
 
 omarchy-theme-update() {
@@ -40,5 +40,5 @@ omarchy-theme-update() {
         command /usr/share/omarchy/bin/omarchy theme update --help
         return
     fi
-    /usr/local/lib/omarchy-guardian/guardian-theme update "$@"
+    /usr/lib/omarchy-guardian/guardian-theme update "$@"
 }
