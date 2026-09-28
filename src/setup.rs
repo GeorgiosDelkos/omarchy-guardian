@@ -141,17 +141,21 @@ fn yes(terminal: &mut dyn Terminal, question: &str) -> bool {
         .is_some_and(|answer| matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
+/// Picks a model; `None` means `fallback`, the model used when this choice
+/// is left unset (OpenCode's default, or the review model for official
+/// packages, because `[agent] model` applies to every class).
 fn choose_model(
     terminal: &mut dyn Terminal,
     environment: &dyn Environment,
     question: &str,
+    fallback: &str,
 ) -> Result<Option<String>, String> {
     let models = environment.models();
     if models.is_empty() {
-        return ask_model(terminal, question);
+        return ask_model(terminal, question, fallback);
     }
 
-    let mut options: Vec<(Option<usize>, String)> = vec![(None, "OpenCode's default model".into())];
+    let mut options: Vec<(Option<usize>, String)> = vec![(None, fallback.to_string())];
     options.extend(
         models
             .iter()
@@ -164,12 +168,16 @@ fn choose_model(
 }
 
 /// Free-text fallback when `opencode models` lists nothing; empty keeps
-/// OpenCode's default model.
-fn ask_model(terminal: &mut dyn Terminal, question: &str) -> Result<Option<String>, String> {
+/// `fallback`.
+fn ask_model(
+    terminal: &mut dyn Terminal,
+    question: &str,
+    fallback: &str,
+) -> Result<Option<String>, String> {
     loop {
         let answer = terminal
             .ask(&format!(
-                "{question}\nEnter provider/model (empty for OpenCode's default):"
+                "{question}\nEnter provider/model (empty for {fallback}):"
             ))
             .ok_or("setup cancelled: no terminal input")?;
         let answer = answer.trim();
@@ -255,11 +263,21 @@ fn tune_agent(
     choice: &mut Choice,
 ) -> Result<(), String> {
     loop {
-        choice.model = choose_model(terminal, environment, "Model for reviews:")?;
+        choice.model = choose_model(
+            terminal,
+            environment,
+            "Model for reviews:",
+            "OpenCode's default model",
+        )?;
+        let official_fallback = choice.model.as_ref().map_or_else(
+            || "OpenCode's default model".to_string(),
+            |model| format!("Same as the review model ({model})"),
+        );
         choice.official_model = choose_model(
             terminal,
             environment,
             "Model for official Arch/Omarchy packages (a fast model keeps updates quick):",
+            &official_fallback,
         )?;
 
         let levels: Vec<(Thinking, String)> = Thinking::ALL
@@ -286,7 +304,25 @@ fn tune_agent(
         };
 
         terminal.say("Testing the reviewer with a malicious and a clean sample...");
-        match environment.test_review(&settings) {
+        let mut result = environment.test_review(&settings);
+
+        // The pacman gate reviews official packages with their own model and
+        // thinking level; prove that pairing too before it goes into the
+        // root-owned system file.
+        let official = official_settings(choice);
+        if result.is_ok()
+            && (official.model != settings.model || official.variant != settings.variant)
+        {
+            terminal.say(&format!(
+                "Testing the official-package reviewer ({})...",
+                official.label()
+            ));
+            result = environment
+                .test_review(&official)
+                .map_err(|reason| format!("official-package reviewer: {reason}"));
+        }
+
+        match result {
             Ok(elapsed) => {
                 terminal.say(&format!("Reviewer works ({}s).", elapsed.as_secs()));
                 return Ok(());
@@ -298,6 +334,23 @@ fn tune_agent(
                 }
             }
         }
+    }
+}
+
+/// What the pacman gate will run for official packages with these choices:
+/// the official model or else `[agent] model`, the profile's official
+/// thinking level, and a `--variant` only if that level is the mapped one.
+fn official_settings(choice: &Choice) -> AgentSettings {
+    let thinking = builtin(choice.profile, SourceClass::Official).thinking;
+    AgentSettings {
+        model: choice
+            .official_model
+            .clone()
+            .or_else(|| choice.model.clone()),
+        thinking,
+        variant: (tested_variant(choice) == Some(thinking)).then(|| thinking.name().to_string()),
+        timeout_secs: 300,
+        ..AgentSettings::default()
     }
 }
 
@@ -613,6 +666,8 @@ mod tests {
         test_passes: bool,
         /// `opencode models` listed nothing.
         no_models: bool,
+        /// A model whose test review fails even when `test_passes` is set.
+        failing_model: Option<&'static str>,
         user_written: RefCell<Option<String>>,
         system_written: RefCell<Option<String>>,
         tested: RefCell<Vec<AgentSettings>>,
@@ -637,7 +692,9 @@ mod tests {
         }
         fn test_review(&self, settings: &AgentSettings) -> Result<Duration, String> {
             self.tested.borrow_mut().push(settings.clone());
-            if self.test_passes {
+            let failing =
+                self.failing_model.is_some() && settings.model.as_deref() == self.failing_model;
+            if self.test_passes && !failing {
                 Ok(Duration::from_secs(3))
             } else {
                 Err("the model did not flag the malicious sample".into())
@@ -735,6 +792,69 @@ mod tests {
                 .model,
             None
         );
+    }
+
+    #[test]
+    fn the_official_package_pairing_is_tested_too() {
+        let environment = Fake {
+            opencode: true,
+            test_passes: true,
+            ..Fake::default()
+        };
+        // profile (default), review model 2 = sonnet, official model 3 =
+        // haiku, thinking (default high), confirm the system write
+        let mut terminal = script(&["", "2", "3", "", "y"]);
+
+        run(&mut terminal, &environment).unwrap();
+
+        assert!(
+            terminal
+                .output
+                .contains("Same as the review model (anthropic/claude-sonnet-5)")
+        );
+        let tested = environment.tested.borrow();
+        assert_eq!(tested.len(), 2);
+        assert_eq!(
+            tested[1].model.as_deref(),
+            Some("anthropic/claude-haiku-4-5")
+        );
+        assert_eq!(tested[1].thinking, Thinking::Low);
+        assert_eq!(tested[1].variant, None);
+    }
+
+    #[test]
+    fn a_failing_official_model_writes_nothing() {
+        let environment = Fake {
+            opencode: true,
+            test_passes: true,
+            failing_model: Some("anthropic/claude-haiku-4-5"),
+            ..Fake::default()
+        };
+        // profile (default), sonnet, haiku, thinking (default), decline retry
+        let mut terminal = script(&["", "2", "3", "", "n"]);
+
+        assert!(run(&mut terminal, &environment).is_err());
+        assert!(terminal.output.contains("official-package reviewer"));
+        assert!(environment.user_written.borrow().is_none());
+        assert!(environment.system_written.borrow().is_none());
+    }
+
+    #[test]
+    fn an_identical_official_pairing_is_tested_once() {
+        let environment = Fake {
+            opencode: true,
+            test_passes: true,
+            ..Fake::default()
+        };
+        // profile (default), sonnet, official = same, thinking 3 = low (the
+        // standard profile's official level), confirm the system write
+        let mut terminal = script(&["", "2", "", "3", "y"]);
+
+        run(&mut terminal, &environment).unwrap();
+
+        let tested = environment.tested.borrow();
+        assert_eq!(tested.len(), 1);
+        assert_eq!(tested[0].variant.as_deref(), Some("low"));
     }
 
     #[test]
