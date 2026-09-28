@@ -4,3 +4,4 @@
 //! (docs/superpowers/specs/2026-09-28-review-engine-design.md).
 
 pub mod diff;
+pub mod plan;
