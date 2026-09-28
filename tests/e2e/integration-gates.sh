@@ -367,8 +367,11 @@ settings_gate() {
     expect_no_mock_run 'makepkg'
 
     # local-only never calls OpenCode and needs a confirmation that an
-    # unattended run (no terminal) cannot give.
+    # unattended run (no terminal) cannot give. theme_gate leaves
+    # good-theme's fixture as its last, malicious variant; regenerate the
+    # clean one so this checks confirmation, not local-rule findings.
     rm -rf -- "$HOME/.config/omarchy/themes/good"
+    make_theme good-theme 'local wallpaper = "/usr/share/backgrounds/omarchy/default.png"'
     printf 'profile = "local-only"\n' >"$user_config"
     run_theme install "$E2E/sources/good-theme" </dev/null >/dev/null 2>&1
     expect 'local-only theme install without a terminal is not confirmed' 2 "$?"
