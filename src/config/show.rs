@@ -34,6 +34,12 @@ fn header(settings: &Settings) -> String {
     if let Some(reason) = settings.privileged_block() {
         let _ = writeln!(text, "Pacman gate: BLOCKED — {reason}");
     }
+    let memory = settings.store_settings();
+    let _ = writeln!(
+        text,
+        "{:<12} cache {} day(s) · store up to {} MiB (user-level classes only)",
+        "Memory", memory.cache_days, memory.max_store_mib
+    );
     text
 }
 
@@ -68,6 +74,8 @@ pub fn render_show(settings: &Settings, classes: &[SourceClass]) -> String {
                     .unwrap_or_else(|| "(agent default)".into()),
                 "timeout_secs" => policy.timeout_secs().to_string(),
                 "confirm" => policy.confirm.to_string(),
+                "cache" => policy.cache.name().to_string(),
+                "diff" => policy.diff.name().to_string(),
                 other => format!("(unknown knob {other})"),
             };
             let _ = writeln!(
@@ -78,11 +86,12 @@ pub fn render_show(settings: &Settings, classes: &[SourceClass]) -> String {
         }
         let _ = writeln!(
             text,
-            "  {:<17} {} · timeout {}s · input {} KiB",
+            "  {:<17} {} · timeout {}s · input {} KiB × up to {} chunk(s)",
             "agent",
             agent.label(),
             agent.timeout_secs,
-            agent.max_input_bytes / 1024
+            agent.max_input_bytes / 1024,
+            agent.max_chunks
         );
         for ignored in &resolved.ignored {
             let _ = writeln!(text, "  ! {ignored}");
@@ -148,6 +157,13 @@ mod tests {
                 "agent             default model · max (provider default) · timeout 300s · input 256 KiB"
             )
         );
+        assert!(text.contains(&format!("  {:<17} {:<17} ({})", "cache", "on", "profile")));
+        assert!(text.contains(&format!("  {:<17} {:<17} ({})", "diff", "off", "profile")));
+        assert!(text.contains("× up to 8 chunk(s)"));
+        assert!(text.contains(&format!(
+            "{:<12} cache 30 day(s) · store up to 256 MiB",
+            "Memory"
+        )));
     }
 
     #[test]
