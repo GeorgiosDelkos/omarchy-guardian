@@ -347,8 +347,10 @@ pub fn remember(memory: &Memory, approved: Option<&[SourceFile]>) -> Vec<String>
     {
         notes.push(format!("could not record the approved baseline: {error}"));
     }
-    let pruned = cache::expire(&memory.store, memory.now, memory.cache_max_age_secs)
-        .and_then(|()| baseline::collect_garbage(&memory.store, memory.max_store_bytes));
+    let pruned =
+        cache::expire(&memory.store, memory.now, memory.cache_max_age_secs).and_then(|()| {
+            baseline::collect_garbage(&memory.store, memory.max_store_bytes, memory.now)
+        });
     if let Err(error) = pruned {
         notes.push(format!("could not prune the review memory: {error}"));
     }

@@ -198,9 +198,11 @@ pub fn forget_all(store: &Store) -> Result<usize, Error> {
     Ok(baselines)
 }
 
-/// Deletes blobs no baseline references, then the oldest baselines until the
-/// store fits in `max_bytes`. Unreadable baselines are deleted.
-pub fn collect_garbage(store: &Store, max_bytes: u64) -> Result<(), Error> {
+/// Deletes stale leftover temp files, blobs no baseline references, then the
+/// oldest baselines until the store fits in `max_bytes`. Unreadable
+/// baselines are deleted.
+pub fn collect_garbage(store: &Store, max_bytes: u64, now: u64) -> Result<(), Error> {
+    store.sweep_stale_temp_files(now)?;
     let mut manifests: Vec<(u64, String, Vec<String>)> = Vec::new();
     for name in store.list(BASELINES)? {
         if let Some(manifest) = read_manifest(store, &name)? {
@@ -425,7 +427,7 @@ mod tests {
         .unwrap();
         store.put_blob(b"orphan").unwrap();
 
-        collect_garbage(&store, u64::MAX).unwrap();
+        collect_garbage(&store, u64::MAX, 1).unwrap();
         assert_eq!(store.list(BLOBS).unwrap().len(), 2);
         assert_eq!(store.list(BASELINES).unwrap().len(), 2);
 
@@ -438,7 +440,7 @@ mod tests {
                 .unwrap();
             u64::try_from(newest_manifest.len() + "new\n".len()).unwrap()
         };
-        collect_garbage(&store, size_of_newest).unwrap();
+        collect_garbage(&store, size_of_newest, 1).unwrap();
         assert!(
             load(&store, SourceClass::Aur, &[unit("", "aur:old")])
                 .unwrap()
@@ -450,7 +452,7 @@ mod tests {
                 .is_some()
         );
 
-        collect_garbage(&store, 0).unwrap();
+        collect_garbage(&store, 0, 1).unwrap();
         assert!(store.list(BASELINES).unwrap().is_empty());
         assert!(store.list(BLOBS).unwrap().is_empty());
     }

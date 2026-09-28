@@ -9,6 +9,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, IoContext};
 use crate::sha256::Sha256;
@@ -19,8 +20,22 @@ pub const VERDICTS: &str = "verdicts";
 
 const TEMP_PREFIX: &str = ".tmp-";
 
+/// Temp file names this many attempts old before `write` gives up: a
+/// leftover from a killed run sharing this pid must not block writes
+/// forever, but a directory that keeps colliding is a sign of real trouble.
+const MAX_TEMP_ATTEMPTS: u32 = 16;
+
+/// Age in seconds beyond which a leftover `.tmp-*` file is swept: a run
+/// killed between opening its temp file and renaming it into place
+/// otherwise leaves that file behind forever.
+const STALE_TEMP_SECS: u64 = 3_600;
+
 pub struct Store {
     root: PathBuf,
+    /// Per-instance so a fresh `Store::open` (once per Guardian run) starts
+    /// its temp names at 0 again; only `process::id()` needs to disambiguate
+    /// two processes, not two counters in the same one.
+    temp_counter: AtomicU64,
 }
 
 impl Store {
@@ -79,7 +94,10 @@ impl Store {
                 return Err(format!("{} is not a directory", path.display()));
             }
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            temp_counter: AtomicU64::new(0),
+        })
     }
 
     fn path(&self, dir: &str, name: &str) -> PathBuf {
@@ -89,23 +107,8 @@ impl Store {
     /// Writes through a new temporary file in the same directory, then
     /// renames it into place, so a reader never sees half a file.
     pub fn write(&self, dir: &str, name: &str, bytes: &[u8]) -> Result<(), Error> {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let target = self.path(dir, name);
-        let temp = self.path(
-            dir,
-            &format!(
-                "{TEMP_PREFIX}{}-{}",
-                process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ),
-        );
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)
-            .at(&temp)?;
+        let (temp, mut file) = self.open_temp(dir)?;
         let written = file.write_all(bytes).and_then(|()| file.sync_all());
         drop(file);
         if let Err(source) = written.and_then(|()| fs::rename(&temp, &target)) {
@@ -114,6 +117,60 @@ impl Store {
                 path: target,
                 source,
             });
+        }
+        Ok(())
+    }
+
+    /// Opens a fresh, exclusively-created temp file in `dir`. A name already
+    /// taken (a leftover from a past run that reused this pid) is retried
+    /// under the next counter value, bounded so a directory that keeps
+    /// colliding cannot loop forever.
+    fn open_temp(&self, dir: &str) -> Result<(PathBuf, fs::File), Error> {
+        let pid = process::id();
+        let mut attempts = 0u32;
+        loop {
+            let counter = self.temp_counter.fetch_add(1, Ordering::Relaxed);
+            let temp = self.path(dir, &format!("{TEMP_PREFIX}{pid}-{counter}"));
+            attempts += 1;
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)
+            {
+                Ok(file) => return Ok((temp, file)),
+                Err(source)
+                    if source.kind() == io::ErrorKind::AlreadyExists
+                        && attempts < MAX_TEMP_ATTEMPTS => {}
+                Err(source) => return Err(Error::Io { path: temp, source }),
+            }
+        }
+    }
+
+    /// Deletes `.tmp-*` files older than an hour from every store directory:
+    /// leftovers from a run killed mid-write that `write` itself never
+    /// cleans up.
+    pub fn sweep_stale_temp_files(&self, now: u64) -> Result<(), Error> {
+        for dir in [BLOBS, BASELINES, VERDICTS] {
+            let path = self.root.join(dir);
+            for entry in fs::read_dir(&path).at(&path)? {
+                let entry = entry.at(&path)?;
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if !name.starts_with(TEMP_PREFIX) {
+                    continue;
+                }
+                let entry_path = path.join(&name);
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .at(&entry_path)?;
+                let age = now.saturating_sub(unix_secs(modified));
+                if age >= STALE_TEMP_SECS {
+                    fs::remove_file(&entry_path).at(&entry_path)?;
+                }
+            }
         }
         Ok(())
     }
@@ -214,11 +271,19 @@ pub fn summary(root: &Path) -> Option<(usize, u64)> {
     }
     let store = Store {
         root: root.to_path_buf(),
+        temp_counter: AtomicU64::new(0),
     };
     Some((
         store.list(BASELINES).map_or(0, |names| names.len()),
         store.size().unwrap_or(0),
     ))
+}
+
+/// Unix seconds for a file's modification time; a time before the epoch
+/// (not expected on a real filesystem) is treated as maximally stale.
+fn unix_secs(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// The effective user id, from `/proc/self/status` (`Uid: real effective saved fs`).
@@ -238,7 +303,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    use super::{BASELINES, BLOBS, Store, VERDICTS, is_hex_digest, summary};
+    use super::{BASELINES, BLOBS, Store, TEMP_PREFIX, VERDICTS, is_hex_digest, summary};
     use crate::test_support::TempDir;
 
     #[test]
@@ -292,6 +357,32 @@ mod tests {
         store.remove(VERDICTS, "k").unwrap();
         store.remove(VERDICTS, "k").unwrap();
         assert!(store.list(VERDICTS).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stale_same_pid_temp_file_does_not_block_the_next_write() {
+        let dir = TempDir::new("store-temp-retry");
+        let root = dir.path().join("store");
+        let store = Store::open(root.clone()).unwrap();
+
+        // A fresh store's temp counter starts at 0, so this is the exact
+        // name write()'s first attempt will try; a leftover from a run that
+        // was killed after opening it (and reused this pid) collides here.
+        let colliding = root
+            .join(VERDICTS)
+            .join(format!("{TEMP_PREFIX}{}-0", std::process::id()));
+        fs::write(&colliding, b"stale").unwrap();
+
+        store.write(VERDICTS, "k", b"value").unwrap();
+
+        assert_eq!(
+            store.read(VERDICTS, "k").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        // write() retries under the next counter value; it never touches
+        // the colliding leftover itself (only the garbage-collection sweep
+        // does, once it is old enough).
+        assert!(colliding.exists());
     }
 
     #[test]
