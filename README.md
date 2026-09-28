@@ -199,9 +199,10 @@ whole source.
 For user-level sources (AUR, themes, plugins and `scan`/`guard`/`sandbox`
 targets), Guardian keeps a review memory in
 `$XDG_STATE_HOME/omarchy-guardian`, default
-`~/.local/state/omarchy-guardian`, mode 0700. Guardian creates only that last
-directory, and only inside an existing directory you own; otherwise the
-report says the memory was not used and the review runs in full:
+`~/.local/state/omarchy-guardian`, mode 0700. Guardian creates it (and any
+missing parents) only under an existing directory you own, so a run under
+`sudo -E` leaves nothing owned by root in your home; otherwise the report
+says the memory was not used and the review runs in full:
 
 - **Verdict cache.** A chunk already judged `clear` or `suspicious`, with the
   same prompt, model, variant, thinking level and class, is not sent again

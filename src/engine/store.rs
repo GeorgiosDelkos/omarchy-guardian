@@ -55,10 +55,10 @@ impl Store {
 
     /// Opens the store, creating it with mode 0700. A store owned by another
     /// user, or open to group or others, is refused: whoever can write it
-    /// can plant cached verdicts. Missing parent directories are never
-    /// created: the store is created only inside an existing directory owned
-    /// by the effective user, so a run under `sudo -E` (which keeps the
-    /// user's HOME) cannot leave root-owned directories in it.
+    /// can plant cached verdicts. A missing store (and missing parents) is
+    /// created only under an existing real directory owned by the effective
+    /// user, so a run under `sudo -E` (which keeps the user's HOME) cannot
+    /// leave root-owned directories in it.
     pub fn open(root: PathBuf) -> Result<Self, String> {
         let describe = |path: &Path, error: io::Error| format!("{}: {error}", path.display());
         let uid = effective_uid()?;
@@ -258,35 +258,48 @@ impl Store {
     }
 }
 
-/// Creates the store directory itself (mode 0700) inside its parent, which
-/// must already exist and be owned by `uid`.
+/// Creates the store directory and any missing parents (mode 0700), but only
+/// when the nearest existing ancestor is a real directory (not a symlink)
+/// owned by `uid`. Under `sudo -E` (euid 0, the user's HOME kept) that
+/// ancestor belongs to the user, so nothing root-owned is created there.
 fn create_root(root: &Path, uid: u32) -> Result<(), String> {
-    let parent = root
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| format!("{} has no parent directory", root.display()))?;
-    let metadata = fs::metadata(parent).map_err(|error| {
-        format!(
-            "{}: {error}; not creating missing parent directories",
-            parent.display()
-        )
-    })?;
-    if !metadata.is_dir() {
-        return Err(format!("{} is not a directory", parent.display()));
+    let ancestor = nearest_existing_ancestor(root)?;
+    let metadata = fs::symlink_metadata(&ancestor)
+        .map_err(|error| format!("{}: {error}", ancestor.display()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "{} is not a real directory; not creating the store under it",
+            ancestor.display()
+        ));
     }
     if metadata.uid() != uid {
         return Err(format!(
-            "{} is owned by uid {}, not {uid}; not creating the store in it",
-            parent.display(),
+            "{} is owned by uid {}, not {uid}; not creating the store under it",
+            ancestor.display(),
             metadata.uid()
         ));
     }
-    match DirBuilder::new().mode(0o700).create(root) {
-        Ok(()) => Ok(()),
-        // Created concurrently; the checks that follow still apply.
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(format!("{}: {error}", root.display())),
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(root)
+        .map_err(|error| format!("{}: {error}", root.display()))
+}
+
+/// The closest ancestor of `root` that exists (as seen by `symlink_metadata`).
+fn nearest_existing_ancestor(root: &Path) -> Result<PathBuf, String> {
+    for ancestor in root
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+    {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => return Ok(ancestor.to_path_buf()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", ancestor.display())),
+        }
     }
+    Err(format!("{} has no existing ancestor", root.display()))
 }
 
 /// A lowercase hex SHA-256 digest, the only names blobs and verdicts use.
@@ -344,7 +357,6 @@ mod tests {
     fn opening_creates_private_directories() {
         let dir = TempDir::new("store-open");
         let root = dir.path().join("state").join("omarchy-guardian");
-        fs::create_dir(dir.path().join("state")).unwrap();
         Store::open(root.clone()).unwrap();
 
         for path in [
@@ -359,18 +371,38 @@ mod tests {
     }
 
     #[test]
-    fn missing_parent_directories_are_not_created() {
+    fn missing_parents_are_created_under_a_directory_the_user_owns() {
         let dir = TempDir::new("store-missing-parent");
-        let state = dir.path().join("state");
+        let state = dir.path().join("local").join("state");
         let root = state.join("omarchy-guardian");
 
-        let error = Store::open(root.clone()).err().unwrap();
-        assert!(error.contains("not creating missing parent"), "{error}");
-        assert!(!state.exists());
-
-        fs::create_dir(&state).unwrap();
         Store::open(root.clone()).unwrap();
+
+        for path in [dir.path().join("local"), state, root.clone()] {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.file_type().is_dir(), "{}", path.display());
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o700,
+                "{}",
+                path.display()
+            );
+        }
         assert!(root.join(BASELINES).is_dir());
+    }
+
+    #[test]
+    fn a_store_is_not_created_under_a_symlinked_ancestor() {
+        let dir = TempDir::new("store-symlink-parent");
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = link.join("state").join("omarchy-guardian");
+
+        let error = Store::open(root).err().unwrap();
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(!real.join("state").exists());
     }
 
     #[test]
