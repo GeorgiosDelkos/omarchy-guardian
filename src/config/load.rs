@@ -1,0 +1,479 @@
+//! Locating, validating and combining the two config files into `Settings`.
+
+use std::env;
+use std::fs;
+use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
+use crate::config::file::{AgentDefaults, PartialConfig, parse};
+use crate::config::model::{
+    AgentSettings, DEFAULT_MAX_INPUT_KIB, Named, Policy, Profile, SourceClass, Thinking,
+};
+use crate::config::resolve::{Layers, Resolved, resolve};
+
+pub const SYSTEM_PATH: &str = "/etc/omarchy-guardian/config.toml";
+
+pub const DEFAULT_OFFICIAL_REPOS: [&str; 7] = [
+    "core",
+    "extra",
+    "multilib",
+    "core-testing",
+    "extra-testing",
+    "multilib-testing",
+    "omarchy",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileStatus {
+    Missing,
+    Loaded,
+    Invalid(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct Settings {
+    system_path: PathBuf,
+    user_path: Option<PathBuf>,
+    system: PartialConfig,
+    user: PartialConfig,
+    system_status: FileStatus,
+    user_status: FileStatus,
+    profile_override: Option<Profile>,
+    privileged_block: Option<String>,
+    warnings: Vec<String>,
+}
+
+/// `$XDG_CONFIG_HOME/omarchy-guardian/config.toml`, else `~/.config/...`.
+#[expect(dead_code, reason = "wired into the CLI in Task 9")]
+pub fn user_config_path() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".config"))
+        })?;
+    Some(base.join("omarchy-guardian").join("config.toml"))
+}
+
+/// The system file and its directory must be root-owned regular entries
+/// that only root can write.
+#[expect(dead_code, reason = "wired into the CLI in Task 9")]
+pub fn check_root_owned(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.file_type().is_file() {
+        return Err("not a regular file".into());
+    }
+    let checks = [(path, metadata)].into_iter().chain(
+        path.parent()
+            .and_then(|parent| fs::metadata(parent).ok().map(|meta| (parent, meta))),
+    );
+    for (entry, metadata) in checks {
+        if metadata.uid() != 0 {
+            return Err(format!(
+                "{} is owned by uid {}, not root",
+                entry.display(),
+                metadata.uid()
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{} is writable by group or others",
+                entry.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+enum Read {
+    Missing,
+    Parsed(PartialConfig),
+    Failed(String),
+}
+
+/// A pluggable check for whether a config file is safely owned.
+type Verify<'a> = dyn Fn(&Path) -> Result<(), String> + 'a;
+
+fn read(path: &Path, secure: Option<&Verify<'_>>) -> Read {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Read::Missing,
+        Err(error) => return Read::Failed(error.to_string()),
+        Ok(_) => {}
+    }
+    if let Some(secure) = secure
+        && let Err(reason) = secure(path)
+    {
+        return Read::Failed(format!("insecure: {reason}"));
+    }
+    match fs::read_to_string(path) {
+        Ok(text) => match parse(path, &text) {
+            Ok(config) => Read::Parsed(config),
+            Err(error) => Read::Failed(error.to_string()),
+        },
+        Err(error) => Read::Failed(error.to_string()),
+    }
+}
+
+impl Settings {
+    #[expect(dead_code, reason = "wired into the CLI in Task 9")]
+    pub fn load() -> Self {
+        Self::load_from(
+            Path::new(SYSTEM_PATH),
+            user_config_path().as_deref(),
+            &check_root_owned,
+        )
+    }
+
+    pub fn load_from(
+        system_path: &Path,
+        user_path: Option<&Path>,
+        secure: &dyn Fn(&Path) -> Result<(), String>,
+    ) -> Self {
+        let mut settings = Self::from_parts(PartialConfig::default(), PartialConfig::default());
+        settings.system_path = system_path.to_path_buf();
+        settings.user_path = user_path.map(Path::to_path_buf);
+
+        match read(system_path, Some(secure)) {
+            Read::Missing => {}
+            Read::Parsed(config) => {
+                settings.system = config;
+                settings.system_status = FileStatus::Loaded;
+            }
+            Read::Failed(reason) => {
+                settings.privileged_block = Some(format!(
+                    "{}: {reason}; fix it (see `omarchy-guardian config check`) before pacman transactions can be reviewed",
+                    system_path.display()
+                ));
+                settings
+                    .warnings
+                    .push(format!("ignoring {}: {reason}", system_path.display()));
+                settings.system_status = FileStatus::Invalid(reason);
+            }
+        }
+
+        if let Some(user_path) = user_path {
+            match read(user_path, None) {
+                Read::Missing => {}
+                Read::Parsed(config) => {
+                    settings.user = config;
+                    settings.user_status = FileStatus::Loaded;
+                }
+                Read::Failed(reason) => {
+                    settings
+                        .warnings
+                        .push(format!("ignoring {}: {reason}", user_path.display()));
+                    settings.user_status = FileStatus::Invalid(reason);
+                }
+            }
+        }
+        settings
+    }
+
+    pub fn from_parts(system: PartialConfig, user: PartialConfig) -> Self {
+        Self {
+            system_path: PathBuf::from(SYSTEM_PATH),
+            user_path: None,
+            system,
+            user,
+            system_status: FileStatus::Missing,
+            user_status: FileStatus::Missing,
+            profile_override: None,
+            privileged_block: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// A one-run profile for user-level classes (`--profile`).
+    pub fn with_profile(mut self, profile: Profile) -> Self {
+        self.profile_override = Some(profile);
+        self
+    }
+
+    pub fn system_profile(&self) -> Profile {
+        self.system.profile.unwrap_or(Profile::Standard)
+    }
+
+    fn user_profile(&self) -> Option<Profile> {
+        self.profile_override.or(self.user.profile)
+    }
+
+    /// The profile whose built-ins a class starts from.
+    pub fn profile_for(&self, class: SourceClass) -> Profile {
+        if class.is_privileged() {
+            self.system_profile()
+        } else {
+            self.user_profile().unwrap_or_else(|| self.system_profile())
+        }
+    }
+
+    pub fn resolve(&self, class: SourceClass) -> Resolved {
+        let system = self.system.class(class);
+        let user = self.user.class(class);
+        resolve(
+            class,
+            &Layers {
+                system_profile: self.system_profile(),
+                system: &system,
+                user_profile: self.user_profile(),
+                user: &user,
+            },
+        )
+    }
+
+    pub fn policy(&self, class: SourceClass) -> Policy {
+        self.resolve(class).policy
+    }
+
+    /// Agent defaults that may influence a class: only the system file for
+    /// pacman-enforced classes, the system then the user file otherwise.
+    fn agent_layers(&self, class: SourceClass) -> Vec<&AgentDefaults> {
+        if class.is_privileged() {
+            vec![&self.system.agent]
+        } else {
+            vec![&self.system.agent, &self.user.agent]
+        }
+    }
+
+    pub fn agent_settings(&self, class: SourceClass) -> AgentSettings {
+        let policy = self.policy(class);
+        let layers = self.agent_layers(class);
+
+        let model = policy
+            .model
+            .clone()
+            .or_else(|| layers.iter().rev().find_map(|layer| layer.model.clone()));
+        let variant = (policy.thinking != Thinking::Default).then(|| {
+            layers
+                .iter()
+                .rev()
+                .find_map(|layer| {
+                    layer
+                        .variants
+                        .iter()
+                        .find(|(level, _)| *level == policy.thinking)
+                        .map(|(_, name)| name.clone())
+                })
+                .unwrap_or_else(|| policy.thinking.name().to_string())
+        });
+        let max_input_kib = layers
+            .iter()
+            .rev()
+            .find_map(|layer| layer.max_input_kib)
+            .unwrap_or(DEFAULT_MAX_INPUT_KIB);
+
+        AgentSettings {
+            model,
+            thinking: policy.thinking,
+            variant,
+            timeout_secs: policy.timeout_secs(),
+            max_input_bytes: max_input_kib as usize * 1024,
+        }
+    }
+
+    pub fn official_repos(&self) -> Vec<String> {
+        self.system.official_repos.clone().unwrap_or_else(|| {
+            DEFAULT_OFFICIAL_REPOS
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        })
+    }
+
+    pub fn privileged_block(&self) -> Option<&str> {
+        self.privileged_block.as_deref()
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    pub fn system_status(&self) -> &FileStatus {
+        &self.system_status
+    }
+
+    pub fn user_status(&self) -> &FileStatus {
+        &self.user_status
+    }
+
+    #[expect(dead_code, reason = "wired into the CLI in Task 9")]
+    pub fn system_path(&self) -> &Path {
+        &self.system_path
+    }
+
+    #[expect(dead_code, reason = "wired into the CLI in Task 9")]
+    pub fn user_path(&self) -> Option<&Path> {
+        self.user_path.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use super::{FileStatus, Settings};
+    use crate::config::file::{AgentDefaults, PartialConfig, PartialPolicy};
+    use crate::config::model::{AiRequirement, Profile, SourceClass, Thinking};
+    use crate::test_support::TempDir;
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "must match the `Verify` callback signature `Settings::load_from` expects"
+    )]
+    fn secure(_: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn insecure(_: &Path) -> Result<(), String> {
+        Err("owned by uid 1000".into())
+    }
+
+    #[test]
+    fn missing_files_mean_the_standard_profile() {
+        let dir = TempDir::new("settings-missing");
+        let settings = Settings::load_from(
+            &dir.path().join("system.toml"),
+            Some(&dir.path().join("user.toml")),
+            &secure,
+        );
+
+        assert_eq!(settings.system_status(), &FileStatus::Missing);
+        assert_eq!(settings.privileged_block(), None);
+        assert_eq!(
+            settings.policy(SourceClass::Official).ai,
+            AiRequirement::Optional
+        );
+        assert_eq!(
+            settings.policy(SourceClass::Aur).ai,
+            AiRequirement::Required
+        );
+    }
+
+    #[test]
+    fn insecure_or_invalid_system_file_blocks_privileged_classes() {
+        let dir = TempDir::new("settings-insecure");
+        let system = dir.path().join("system.toml");
+        fs::write(&system, "profile = \"local-only\"\n").unwrap();
+
+        let settings = Settings::load_from(&system, None, &insecure);
+        assert!(
+            settings
+                .privileged_block()
+                .unwrap()
+                .contains("owned by uid 1000")
+        );
+        assert!(matches!(settings.system_status(), FileStatus::Invalid(_)));
+        // User-level classes fall back to the built-in standard profile.
+        assert_eq!(
+            settings.policy(SourceClass::Theme).ai,
+            AiRequirement::Required
+        );
+
+        fs::write(&system, "profile = \"bogus\"\n").unwrap();
+        let settings = Settings::load_from(&system, None, &secure);
+        assert!(
+            settings
+                .privileged_block()
+                .unwrap()
+                .contains("config check")
+        );
+    }
+
+    #[test]
+    fn an_invalid_user_file_is_ignored_with_a_warning() {
+        let dir = TempDir::new("settings-user");
+        let user = dir.path().join("user.toml");
+        fs::write(&user, "[class.aur]\nai = \"sometimes\"\n").unwrap();
+
+        let settings = Settings::load_from(&dir.path().join("none.toml"), Some(&user), &secure);
+        assert!(matches!(settings.user_status(), FileStatus::Invalid(_)));
+        assert_eq!(settings.warnings().len(), 1);
+        assert_eq!(
+            settings.policy(SourceClass::Aur).ai,
+            AiRequirement::Required
+        );
+    }
+
+    #[test]
+    fn agent_settings_follow_layers_and_privilege() {
+        let system = PartialConfig {
+            agent: AgentDefaults {
+                model: Some("anthropic/claude-sonnet-5".into()),
+                max_input_kib: Some(512),
+                variants: vec![(Thinking::Max, "xhigh".into())],
+            },
+            ..PartialConfig::default()
+        };
+        let user = PartialConfig {
+            agent: AgentDefaults {
+                model: Some("ollama/qwen3".into()),
+                max_input_kib: None,
+                variants: vec![(Thinking::High, "deep".into())],
+            },
+            classes: vec![(
+                SourceClass::Aur,
+                PartialPolicy {
+                    thinking: Some(Thinking::Max),
+                    ..PartialPolicy::default()
+                },
+            )],
+            ..PartialConfig::default()
+        };
+        let settings = Settings::from_parts(system, user);
+
+        let official = settings.agent_settings(SourceClass::Official);
+        assert_eq!(official.model.as_deref(), Some("anthropic/claude-sonnet-5"));
+        assert_eq!(official.variant.as_deref(), Some("low"));
+        assert_eq!(official.max_input_bytes, 512 * 1024);
+
+        let aur = settings.agent_settings(SourceClass::Aur);
+        assert_eq!(aur.model.as_deref(), Some("ollama/qwen3"));
+        assert_eq!(aur.variant.as_deref(), Some("xhigh"));
+        assert_eq!(aur.timeout_secs, 300);
+
+        let theme = settings.agent_settings(SourceClass::Theme);
+        assert_eq!(theme.variant.as_deref(), Some("deep"));
+    }
+
+    #[test]
+    fn profile_override_applies_to_user_level_classes_only() {
+        let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default())
+            .with_profile(Profile::LocalOnly);
+        assert_eq!(settings.policy(SourceClass::Source).ai, AiRequirement::Off);
+        assert_eq!(
+            settings.policy(SourceClass::Official).ai,
+            AiRequirement::Optional
+        );
+        assert_eq!(
+            settings.profile_for(SourceClass::Source),
+            Profile::LocalOnly
+        );
+        assert_eq!(
+            settings.profile_for(SourceClass::Official),
+            Profile::Standard
+        );
+    }
+
+    #[test]
+    fn official_repos_default_and_override() {
+        let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default());
+        assert!(settings.official_repos().contains(&"omarchy".to_string()));
+
+        let custom = PartialConfig {
+            official_repos: Some(vec!["core".into()]),
+            ..PartialConfig::default()
+        };
+        let user = PartialConfig {
+            official_repos: Some(vec!["evil".into()]),
+            ..PartialConfig::default()
+        };
+        assert_eq!(
+            Settings::from_parts(custom, user).official_repos(),
+            ["core"]
+        );
+    }
+}
