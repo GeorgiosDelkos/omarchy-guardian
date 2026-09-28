@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 use crate::config::Settings;
-use crate::config::model::{Named, Profile, SourceClass};
+use crate::config::model::{AiRequirement, Named, Profile, SourceClass};
 use crate::pacman::{self, HookArgs};
 use crate::report::{Blocked, Decision, Report};
 use crate::review::{self, ReviewContext};
@@ -115,7 +115,8 @@ fn settings_for(target: &Target, settings: &Settings) -> Settings {
     }
 }
 
-/// Reviews a target and applies confirmation; prints the report.
+/// Reviews a target, applies confirmation, then prints the report once with
+/// the final decision — never a stale pre-confirmation headline.
 fn review_and_decide(
     target: &Target,
     settings: &Settings,
@@ -131,12 +132,19 @@ fn review_and_decide(
         },
     );
     let mut decision = report.decide(&|class| settings.policy(class));
-    report.print(target.show_hashes, decision);
 
+    // Confirmation is only meaningful when the class was never sent to the
+    // AI provider at all (`ai = off`); it never substitutes for a review.
+    let policy = settings.policy(target.class);
     if let Some(confirm) = confirm
         && decision.allows_running()
-        && settings.policy(target.class).confirm
+        && policy.confirm
+        && policy.ai == AiRequirement::Off
     {
+        eprintln!(
+            "Local checks: {} text file(s), no blocking findings.",
+            report.text_files_reviewed
+        );
         let question = format!(
             "Local checks found nothing blocking in {}. No AI review ran. Run it?",
             report.subject
@@ -145,6 +153,8 @@ fn review_and_decide(
             decision = Decision::Blocked(Blocked::NotConfirmed);
         }
     }
+
+    report.print(target.show_hashes, decision);
     (report, decision)
 }
 
@@ -170,7 +180,11 @@ fn guard_command(
     let (report, decision) = review_and_decide(target, &settings, opencode, Some(confirm));
 
     if !decision.allows_running() {
-        eprintln!("Guardian blocked the command because the review did not allow it.");
+        if decision == Decision::Blocked(Blocked::NotConfirmed) {
+            eprintln!("Guardian did not start the command: not confirmed.");
+        } else {
+            eprintln!("Guardian blocked the command because the review did not allow it.");
+        }
         return decision.exit_code();
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &report.snapshot) {
@@ -220,7 +234,13 @@ fn sandbox_command(
         review_and_decide(target, &settings, &OpenCode::UserPath, Some(confirm));
 
     if !decision.allows_running() {
-        eprintln!("Guardian did not run the sandbox command because the review did not allow it.");
+        if decision == Decision::Blocked(Blocked::NotConfirmed) {
+            eprintln!("Guardian did not start the sandbox command: not confirmed.");
+        } else {
+            eprintln!(
+                "Guardian did not run the sandbox command because the review did not allow it."
+            );
+        }
         return decision.exit_code();
     }
     match sandbox::run(&target.config, &report.snapshot, command) {
@@ -419,10 +439,11 @@ mod tests {
     use std::path::PathBuf;
     use std::process::ExitCode;
 
-    use super::{Confirm, Invocation, Target, guard_command, parse};
+    use super::{Confirm, Invocation, Target, guard_command, parse, review_and_decide};
     use crate::config::Settings;
-    use crate::config::file::PartialConfig;
-    use crate::config::model::{Profile, SourceClass};
+    use crate::config::file::{PartialConfig, PartialPolicy};
+    use crate::config::model::{AiRequirement, Profile, SourceClass};
+    use crate::report::{Blocked, Decision};
     use crate::scan::ScanConfig;
     use crate::test_support::{TempDir, mock_opencode};
     use crate::tools::OpenCode;
@@ -655,5 +676,68 @@ mod tests {
         ] {
             assert!(parse(&args(bad)).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn guard_under_local_only_with_a_declined_confirm_is_not_confirmed() {
+        let dir = TempDir::new("confirm-declined");
+        fs::write(dir.path().join("theme.conf"), "name = \"good\"\n").unwrap();
+        let target = Target {
+            class: SourceClass::Theme,
+            ..target(&dir)
+        };
+        let settings = local_only();
+
+        let mut declined = Scripted(Some(false), Vec::new());
+        let (_, decision) =
+            review_and_decide(&target, &settings, &unavailable(), Some(&mut declined));
+        assert_eq!(decision, Decision::Blocked(Blocked::NotConfirmed));
+
+        let mut declined = Scripted(Some(false), Vec::new());
+        let status = guard_command(
+            &target,
+            &args(&["true"]),
+            &settings,
+            &unavailable(),
+            &mut declined,
+            &mut |_| panic!("launched without confirmation"),
+        );
+        assert_eq!(status, ExitCode::from(2));
+    }
+
+    #[test]
+    fn confirm_is_ignored_unless_ai_is_off() {
+        let dir = TempDir::new("confirm-ai-required");
+        let bin = TempDir::new("confirm-ai-required-bin");
+        fs::write(dir.path().join("theme.conf"), "name = \"good\"\n").unwrap();
+        let target = Target {
+            class: SourceClass::Theme,
+            ..target(&dir)
+        };
+        // Standard profile leaves ai = required for a non-official class; a
+        // user file may still set confirm = true, but it must not be asked.
+        let user = PartialConfig {
+            classes: vec![(
+                SourceClass::Theme,
+                PartialPolicy {
+                    confirm: Some(true),
+                    ..PartialPolicy::default()
+                },
+            )],
+            ..PartialConfig::default()
+        };
+        let settings = Settings::from_parts(PartialConfig::default(), user);
+        assert_eq!(
+            settings.policy(SourceClass::Theme).ai,
+            AiRequirement::Required
+        );
+        assert!(settings.policy(SourceClass::Theme).confirm);
+
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let mut confirm = Scripted(Some(true), Vec::new());
+        let (_, decision) = review_and_decide(&target, &settings, &opencode, Some(&mut confirm));
+
+        assert_eq!(decision, Decision::Clear);
+        assert!(confirm.1.is_empty());
     }
 }

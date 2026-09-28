@@ -35,6 +35,7 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
         .settings
         .agent_settings(context.class)
         .max_input_bytes;
+    report.agent_disabled = context.settings.policy(context.class).ai == AiRequirement::Off;
 
     let (snapshot, walk_gaps) = scan::walk(config, &mut |file: TextFile<'_>| {
         analyze_text(&mut report, file.rel, file.text, true);
@@ -80,6 +81,9 @@ pub fn analyze_text(report: &mut Report, rel: &str, text: &str, inspect_dependen
 }
 
 fn queue_for_agent(report: &mut Report, rel: &str, text: &str) {
+    if report.agent_disabled {
+        return;
+    }
     if rules::is_sensitive_path(rel) {
         report.gaps.push(Gap::SensitiveWithheld(rel.to_string()));
         return;
@@ -470,5 +474,32 @@ mod tests {
             .map(|run| run.files.as_slice())
             .collect();
         assert!(files.contains(&&["a/.INSTALL".to_string()][..]));
+    }
+
+    #[test]
+    fn ai_off_skips_agent_input_gaps() {
+        let dir = TempDir::new("agent-disabled");
+        fs::write(dir.path().join(".env"), "TOKEN=x\n").unwrap();
+        fs::write(dir.path().join("big.txt"), "a".repeat(40 * 1024)).unwrap();
+        let system = PartialConfig {
+            agent: AgentDefaults {
+                max_input_kib: Some(16),
+                ..AgentDefaults::default()
+            },
+            ..PartialConfig::default()
+        };
+        let settings =
+            Settings::from_parts(system, PartialConfig::default()).with_profile(Profile::LocalOnly);
+
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Theme, &unavailable()),
+        );
+
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+        assert_eq!(
+            report.decide(&|class| settings.policy(class)),
+            Decision::Clear
+        );
     }
 }
