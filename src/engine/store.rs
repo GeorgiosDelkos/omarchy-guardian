@@ -55,16 +55,19 @@ impl Store {
 
     /// Opens the store, creating it with mode 0700. A store owned by another
     /// user, or open to group or others, is refused: whoever can write it
-    /// can plant cached verdicts.
+    /// can plant cached verdicts. Missing parent directories are never
+    /// created: the store is created only inside an existing directory owned
+    /// by the effective user, so a run under `sudo -E` (which keeps the
+    /// user's HOME) cannot leave root-owned directories in it.
     pub fn open(root: PathBuf) -> Result<Self, String> {
         let describe = |path: &Path, error: io::Error| format!("{}: {error}", path.display());
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&root)
-            .map_err(|error| describe(&root, error))?;
-
         let uid = effective_uid()?;
+        match fs::symlink_metadata(&root) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => create_root(&root, uid)?,
+            Err(error) => return Err(describe(&root, error)),
+        }
+
         let metadata = fs::symlink_metadata(&root).map_err(|error| describe(&root, error))?;
         if !metadata.file_type().is_dir() {
             return Err(format!("{} is not a directory", root.display()));
@@ -255,6 +258,37 @@ impl Store {
     }
 }
 
+/// Creates the store directory itself (mode 0700) inside its parent, which
+/// must already exist and be owned by `uid`.
+fn create_root(root: &Path, uid: u32) -> Result<(), String> {
+    let parent = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| format!("{} has no parent directory", root.display()))?;
+    let metadata = fs::metadata(parent).map_err(|error| {
+        format!(
+            "{}: {error}; not creating missing parent directories",
+            parent.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a directory", parent.display()));
+    }
+    if metadata.uid() != uid {
+        return Err(format!(
+            "{} is owned by uid {}, not {uid}; not creating the store in it",
+            parent.display(),
+            metadata.uid()
+        ));
+    }
+    match DirBuilder::new().mode(0o700).create(root) {
+        Ok(()) => Ok(()),
+        // Created concurrently; the checks that follow still apply.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(format!("{}: {error}", root.display())),
+    }
+}
+
 /// A lowercase hex SHA-256 digest, the only names blobs and verdicts use.
 pub fn is_hex_digest(text: &str) -> bool {
     text.len() == 64
@@ -310,6 +344,7 @@ mod tests {
     fn opening_creates_private_directories() {
         let dir = TempDir::new("store-open");
         let root = dir.path().join("state").join("omarchy-guardian");
+        fs::create_dir(dir.path().join("state")).unwrap();
         Store::open(root.clone()).unwrap();
 
         for path in [
@@ -321,6 +356,21 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{}", path.display());
         }
+    }
+
+    #[test]
+    fn missing_parent_directories_are_not_created() {
+        let dir = TempDir::new("store-missing-parent");
+        let state = dir.path().join("state");
+        let root = state.join("omarchy-guardian");
+
+        let error = Store::open(root.clone()).err().unwrap();
+        assert!(error.contains("not creating missing parent"), "{error}");
+        assert!(!state.exists());
+
+        fs::create_dir(&state).unwrap();
+        Store::open(root.clone()).unwrap();
+        assert!(root.join(BASELINES).is_dir());
     }
 
     #[test]

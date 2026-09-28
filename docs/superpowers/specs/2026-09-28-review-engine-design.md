@@ -181,6 +181,11 @@ The reply format is unchanged.
 - If the store directory is not owned by the current user, or is accessible
   to group or others, the store is not used for this run and the report
   carries a note (section 11).
+- Missing parent directories are never created. A missing store directory
+  is created (mode 0700) only when its parent exists and is owned by the
+  effective user; otherwise the store is not used for this run and the
+  report carries a note. Under `sudo -E` (HOME kept), this stops a root run
+  from leaving root-owned directories in the user's home.
 - Pacman classes never open the store. The pacman hook never passes
   `--identity`.
 
@@ -306,7 +311,7 @@ review in the same run.
 
 | Failure | Result |
 |---|---|
-| Store unreadable, unwritable, wrong owner or mode | No cache, no baseline, full review; a note in the report |
+| Store unreadable, unwritable, wrong owner or mode; store missing and its parent missing or owned by another user | No cache, no baseline, full review; a note in the report |
 | Corrupt baseline or blob hash mismatch | Baseline deleted, full review |
 | Diff input over 1 MiB, or a trimmed middle over 4,000,000 table cells | That file sent whole |
 | Any chunk invalid | Whole review blocked (existing invalid outcome); nothing cached from this run |
