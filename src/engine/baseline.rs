@@ -140,8 +140,10 @@ fn load_unit(
 }
 
 /// Records each unit's reviewed files as its approved version. Paths that
-/// contain a newline cannot be listed in a manifest and are left out, so
-/// they are reviewed whole next time.
+/// contain a newline or a carriage return cannot be listed in a manifest
+/// and are left out, so they are reviewed whole next time (`str::lines`
+/// strips a trailing '\r' too, so such a path would otherwise round-trip
+/// under the wrong key).
 pub fn record(
     store: &Store,
     class: SourceClass,
@@ -158,7 +160,7 @@ pub fn record(
             let Some(path) = file.path.strip_prefix(unit.prefix.as_str()) else {
                 continue;
             };
-            if path.is_empty() || path.contains('\n') {
+            if path.is_empty() || path.contains('\n') || path.contains('\r') {
                 continue;
             }
             let digest = store.put_blob(file.content.as_bytes())?;
@@ -321,7 +323,11 @@ mod tests {
             &store,
             SourceClass::Source,
             &units,
-            &[file("my file.c", "a\n"), file("bad\nname.c", "b\n")],
+            &[
+                file("my file.c", "a\n"),
+                file("bad\nname.c", "b\n"),
+                file("bad\rname.c", "c\n"),
+            ],
             1,
         )
         .unwrap();
