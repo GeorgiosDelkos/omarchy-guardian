@@ -1,7 +1,7 @@
 #!/usr/bin/bash
 set -euo pipefail
 
-GUARDIAN=/usr/local/bin/omarchy-guardian
+GUARDIAN=/usr/bin/omarchy-guardian
 OMARCHY_BIN_DIR=/usr/share/omarchy/bin
 THEMES_DIR="$HOME/.config/omarchy/themes"
 MODE=${1:-}

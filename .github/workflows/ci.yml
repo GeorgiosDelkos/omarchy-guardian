@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    # Guardian is Arch-only (pacman, bsdtar, pacman-conf paths), so it is
+    # built and tested on Arch.
+    container: archlinux:base-devel
+    steps:
+      - name: Install toolchain and test tools
+        run: pacman -Syu --noconfirm --needed rust git libarchive
+      - uses: actions/checkout@v4
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Shell syntax
+        run: |
+          for script in integrations/*.sh integrations/*/guardian-* integrations/omarchy/*.sh tests/e2e/*.sh; do
+            bash -n "$script"
+          done

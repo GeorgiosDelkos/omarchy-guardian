@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-interceptor=/usr/local/lib/omarchy-guardian/omarchy-bash-interceptor.sh
+interceptor=/usr/lib/omarchy-guardian/omarchy-bash-interceptor.sh
 bashrc="$HOME/.bashrc"
 source_line="[[ -r $interceptor ]] && source $interceptor"
 marker="# Omarchy Guardian theme command interception"

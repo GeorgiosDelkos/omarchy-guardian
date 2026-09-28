@@ -1,29 +1,38 @@
 #!/bin/sh
 set -eu
 
-GUARDIAN=/usr/local/bin/omarchy-guardian
+GUARDIAN=/usr/bin/omarchy-guardian
 
 if [ ! -x "$GUARDIAN" ]; then
     printf '%s\n' "omarchy-guardian is not installed at $GUARDIAN" >&2
     exit 2
 fi
 
+# libalpm runs hooks as direct children of pacman after chroot + chdir("/"),
+# so the transaction's argv and working directory are read from the parent.
+pacman_pid=$PPID
+if ! pacman_cwd=$(readlink -f "/proc/$pacman_pid/cwd"); then
+    printf '%s\n' "Cannot read the working directory of pacman (pid $pacman_pid)." >&2
+    exit 2
+fi
+
 if [ "$(id -u)" -eq 0 ]; then
-    invoking_user=${SUDO_USER:-}
+    invoking_user=${SUDO_USER:-${DOAS_USER:-}}
     if [ -z "$invoking_user" ] || [ "$invoking_user" = root ]; then
         printf '%s\n' "Cannot run the Guardian package review as the invoking user." >&2
         exit 2
     fi
-    GUARDIAN_ORIGINAL_PWD=$(pwd -P)
-    export GUARDIAN_ORIGINAL_PWD
+    GUARDIAN_PACMAN_PID=$pacman_pid
+    GUARDIAN_PACMAN_CWD=$pacman_cwd
+    export GUARDIAN_PACMAN_PID GUARDIAN_PACMAN_CWD
+    # The review runs unprivileged. It still insists on a root-owned OpenCode
+    # binary, because this gate sits in front of a root transaction.
     exec /usr/bin/runuser --login \
-        --whitelist-environment=SUDO_COMMAND,GUARDIAN_ORIGINAL_PWD \
-        --command 'exec /usr/local/bin/omarchy-guardian pacman-hook "$SUDO_COMMAND" "$GUARDIAN_ORIGINAL_PWD"' \
+        --whitelist-environment=GUARDIAN_PACMAN_PID,GUARDIAN_PACMAN_CWD \
+        --command 'exec /usr/bin/omarchy-guardian pacman-hook --pacman-pid "$GUARDIAN_PACMAN_PID" --cwd "$GUARDIAN_PACMAN_CWD"' \
         "$invoking_user"
 fi
 
-if [ -z "${SUDO_COMMAND:-}" ]; then
-    printf '%s\n' "Pacman hook did not receive the sudo transaction command." >&2
-    exit 2
-fi
-exec "$GUARDIAN" pacman-hook "$SUDO_COMMAND" "$(pwd -P)"
+# Only reachable when the hook is run without root, which pacman never does;
+# the end-to-end tests use this branch with an OpenCode from PATH.
+exec "$GUARDIAN" pacman-hook --pacman-pid "$pacman_pid" --cwd "$pacman_cwd" --opencode-from-path

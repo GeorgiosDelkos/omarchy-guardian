@@ -1,0 +1,78 @@
+//! Helpers shared by unit tests.
+
+use std::env;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A temporary directory removed on drop, even when the test panics.
+pub struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    pub fn new(label: &str) -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "guardian-test-{label}-{}-{nanos}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        drop(fs::remove_dir_all(&self.path));
+    }
+}
+
+pub fn write_script(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Tests that need an Arch tool skip themselves where it is missing.
+pub fn tool_available(path: &str) -> bool {
+    Path::new(path).is_file()
+}
+
+/// A fake `opencode` that records its argv and stdin next to itself, insists
+/// on the deny-all permission config, and answers with `status`. With
+/// `echo_nonce` false it answers with the wrong nonce.
+pub fn mock_opencode(dir: &Path, status: &str, echo_nonce: bool) -> PathBuf {
+    let binary = dir.join("opencode");
+    let nonce = if echo_nonce {
+        r#"$(sed -n 's/^Nonce: //p' "$dir/stdin")"#
+    } else {
+        "wrong"
+    };
+    write_script(
+        &binary,
+        &format!(
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+printf '%s\n' "$@" >"$dir/args"
+case "$OPENCODE_CONFIG_CONTENT" in *'"*":"deny"'*) ;; *) exit 8 ;; esac
+cat >"$dir/stdin"
+nonce={nonce}
+reply="{{\"nonce\":\"$nonce\",\"status\":\"{status}\",\"summary\":\"mock\",\"findings\":[]}}"
+escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
+printf '{{"type":"text","part":{{"type":"text","text":"%s"}}}}\n' "$escaped"
+"#
+        ),
+    );
+    binary
+}

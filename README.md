@@ -1,157 +1,176 @@
 # Omarchy Guardian
 
-Omarchy Guardian is an early prototype for inspecting downloaded source code
-before a user runs or installs it.
+Omarchy Guardian inspects downloaded source code before you run or install it
+on Arch Linux / Omarchy. It is an early, heuristic tool: a clear result is not
+a safety guarantee.
 
-## Current prototype
+It is a single Rust binary with **no third-party crates**. SHA-256, JSON, and
+the small subset of TOML it needs are implemented in the crate so the whole
+gate can be audited in one place. It builds only for Linux.
 
-Build, scan source, or gate a command on a clean review:
+## Commands
 
 ```sh
-cargo build --release
-cargo run -- scan ./downloaded-project
-cargo run -- scan --thorough --hashes ./theme-checkout
-cargo run -- guard --thorough ./aur-build-directory -- makepkg --noconfirm
-cargo run -- sandbox ./theme-checkout -- /usr/bin/true
+omarchy-guardian scan ./downloaded-project
+omarchy-guardian scan --thorough --hashes ./theme-checkout
+omarchy-guardian guard --thorough ./aur-build-directory -- makepkg --noconfirm
+omarchy-guardian sandbox ./theme-checkout -- /usr/bin/true
 ```
 
-The scanner checks readable text files for suspicious patterns and asks the
-installed OpenCode CLI to review the exact source text for security risks. The
-review agent has tools disabled and is instructed to treat source as untrusted
-data. It also checks for download-to-shell pipelines, encoded command
-execution, access to common credential files, destructive system commands,
-persistence changes, shell execution, and privilege escalation. It doesn't
-follow symlinks and skips common generated/dependency directories (`.git`,
-`target`, `node_modules`, `.venv`, `vendor`, `dist`, and `build`). Use
-`--thorough` for install gates to include those directories (still excluding
-`.git`). Binary assets are not source-reviewed; text files larger than 2 MiB
-make the scan incomplete. Files over the 512 MiB integrity-hash limit also make
-the scan incomplete. AI review input is limited to 256 KiB.
-Files that look sensitive by path (such as `.env*`, SSH/AWS credentials,
-private-key files, and names containing `secret`, `credential`, or `token`) are
-withheld from the model, and the scan is reported as incomplete.
+- `scan` reviews a file or directory and prints a report.
+- `guard` reviews, then re-hashes the tree, then **replaces itself** with the
+  command (`exec`) only if the review was clear and nothing changed.
+  `--exclude NAME` (repeatable) leaves a top-level directory out of both the
+  review and the snapshot.
+- `sandbox` reviews, copies the tree to a private temporary directory, proves
+  the copy matches the reviewed snapshot, and runs the command in Bubblewrap
+  with the network isolated, no host home directory and a read-only system.
+  It is a behaviour smoke test, not a dynamic malware detector.
 
-OpenCode must be installed, configured with a working model/provider, and
-available as `opencode` in `PATH`. Source text is sent to the provider selected
-by the user's OpenCode configuration; that may be a local model or an external
-service. If the agent cannot run or return a valid report, Guardian marks the
-scan incomplete rather than reporting it as clean.
+Exit codes: `0` clear (or a scriptlet-free pacman transaction), `1` findings,
+`2` incomplete review or usage error. Once `guard` or `sandbox` starts the
+command, the exit code is the command's own (128 + signal if it was killed).
+Guardian announces on stderr when it starts the command, so its own blocks can
+be told apart from the command's failures.
 
-Exit codes:
+## What is checked
 
-- `0`: no concerning patterns found by the local checks or agent
-- `1`: one or more concerning patterns found
-- `2`: invalid usage or an incomplete scan
+- **Local rules** on every text file except prose (`*.md`, `*.rst`, `README`,
+  `LICENSE`, ...): download-to-shell pipelines, encoded command execution,
+  credential file access, destructive commands (a recursive `rm` of `/` or
+  `$HOME` itself, `mkfs`, raw-disk writes), persistence, shell execution,
+  privilege escalation, disabled TLS verification and likely credential
+  exfiltration. Identifier patterns respect word boundaries, so `retrieval(`
+  and `model.eval()` do not match `eval(`. Prose is still sent to the AI review.
+- **Network destinations:** literal HTTP(S) hosts in code and runtime config,
+  flagging cleartext HTTP and hard-coded IP addresses. URL paths, queries and
+  credentials are never printed.
+- **Dependencies:** `Cargo.lock`, npm lockfiles, `poetry.lock`, `go.sum` and
+  exactly pinned `requirements*.txt` are checked with the public OSV API (only
+  package names and versions are sent). Advisory severities and summaries are
+  fetched per advisory; ones OSV does not rate are shown as `UNRATED`. Any
+  advisory blocks a gate. Unsupported lockfiles, manifests with dependencies
+  but no lockfile, or an unavailable OSV API make the review incomplete.
+- **AI review:** the reviewable text (up to 256 KiB) is sent to the OpenCode
+  CLI **on stdin** (never in argv, which is size-limited and visible to other
+  users) with every OpenCode tool and permission denied. The reply must echo a
+  random per-run nonce that only exists in that input, so a reply that never
+  saw the source is rejected. Files that look sensitive by path (`.env*`, SSH
+  and cloud credentials, key files, names containing `secret`, `credential` or
+  `token`) are withheld and make the review incomplete.
+- **Integrity:** a SHA-256 manifest of every scanned file. `guard` and
+  `sandbox` re-hash immediately before running the command.
 
-Reports lead with a colored verdict (`CLEAR`, `HIGH RISK`/`REVIEW REQUIRED`,
-`INCOMPLETE`, or `LIMITED REVIEW`), then coverage, alert counts, local matches,
-and the OpenCode assessment. ANSI colors are used only for a terminal and are
-disabled when `NO_COLOR` is set.
+The walk never follows symbolic links, including ones swapped in while it
+runs: directories are read through verified `/proc/self/fd` handles and every
+opened file is checked against its earlier `lstat`. Symlinks, special files,
+non-UTF-8 file names, text files over 2 MiB, files over 512 MiB, unresolved
+Git LFS pointers and an AI review that fails or is inconclusive all make the
+review **incomplete**, never clear. `.git` is always skipped; `target`,
+`node_modules`, `.venv`, `vendor`, `dist` and `build` are skipped unless
+`--thorough` is given.
 
-## Additional checks
+External helpers are run by absolute path (`/usr/bin/curl`, `/usr/bin/bsdtar`,
+`/usr/bin/pacman`, ...) with a timeout and bounded output. OpenCode is looked
+up in the absolute entries of `PATH` for `scan`, `guard` and `sandbox`. The
+pacman hook only accepts a root-owned `/usr/bin/opencode` or
+`/usr/local/bin/opencode`, because it gates a root transaction and a
+user-writable reviewer could be replaced by user-level malware. OpenCode must
+be configured with a working provider; source leaves the machine through that
+provider.
 
-- **Network requests:** Guardian inventories literal HTTP(S) destinations in
-  source/config files, flags cleartext HTTP and hard-coded IP destinations, and
-  looks for same-line combinations of sensitive-data access and outbound sends.
-  This is static analysis; it does not rate destination reputation or observe
-  live traffic.
-- **Dependencies:** `Cargo.lock`, npm lockfiles, `poetry.lock`, `go.sum`, and
-  exactly pinned `requirements*.txt` entries are checked with the public OSV
-  API. Only package coordinates and versions are sent to OSV. Unsupported lock
-  formats, missing locks for declared dependencies, or an unavailable OSV check
-  make the scan incomplete.
-- **Integrity:** Guardian prints a SHA-256 manifest for scanned files. `guard`
-  re-hashes and compares the file set immediately before it starts the guarded
-  command; `sandbox` verifies its temporary copy against that same manifest.
-  Use `scan --hashes <path>` to print individual hashes. This ties the action to
-  the reviewed files, but does not prove that a compiled or installed binary
-  came from that source.
-- **Sandbox:** `sandbox` first requires a clean review, then runs the requested
-  command with Bubblewrap in a disposable copy, with network isolated, no host
-  home directory, and the system filesystem mounted read-only. It is an
-  optional behavior smoke test, not a complete dynamic malware detector.
+## Install (Arch Linux / Omarchy)
 
-## Important limitations
+```sh
+cd packaging/arch
+makepkg -si
+sudo /usr/lib/omarchy-guardian/enable-system-hook.sh
+yay --makepkg /usr/lib/omarchy-guardian/guardian-makepkg --save -P --stats
+```
 
-This is an AI-assisted heuristic prototype, not a guarantee that software is
-safe. It can miss malicious behavior, and benign code can match a rule. A clean
-result only means the configured agent, static checks, and available OSV audit
-didn't identify a problem in the files they reviewed. The reviewer has no
-tools, but source still leaves the machine through the configured
-model/provider. The dependency check sends package names and versions to OSV.
-Guardian does not inspect compiled package payloads or all dependency-lockfile
-formats, and it cannot establish that an installed binary was built from the
-scanned source. The `guard` command runs its requested command only after a
-clear review and a matching SHA-256 snapshot.
+Installing the package activates nothing. `enable-system-hook.sh` links the
+pacman hook into `/etc/pacman.d/hooks/` and adds the theme interceptor to the
+invoking user's `~/.bashrc`.
 
-## Tests
+### Pacman hook
 
-`cargo test` runs the scanner, hashing, dependency, reporting, and guard unit
-tests. The integration gates (Pacman hook, yay shim, and theme
-install/update) are covered end to end by:
+A pre-transaction hook (`AbortOnFail`) that reviews the `.INSTALL` scriptlets
+of the exact archives being installed:
+
+- For `pacman -S`, each target's sync-database version (`pacman -Si`) is
+  located in the configured `CacheDir`s (`pacman-conf`), and each archive's
+  package name is confirmed with `pacman -Qqp`.
+- For `pacman -U`, the archives named on pacman's command line are used,
+  resolved against pacman's own working directory. Remote URLs are refused.
+
+libalpm runs hooks as children of pacman after `chroot` + `chdir("/")`, so the
+hook reads pacman's exact argv from `/proc/<pid>/cmdline` and its working
+directory from `/proc/<pid>/cwd`, then drops to the invoking user (`sudo` or
+`doas`) for the review. Transactions it cannot attribute to pacman, to an
+invoking user, or to an archive are blocked. Front ends that call libalpm
+directly (for example pamac) are not supported and will be blocked.
+
+### yay makepkg gate
+
+Runs `guard --thorough --exclude src --exclude pkg` on the AUR build directory
+before every `makepkg` invocation. The PKGBUILD, install scripts, patches and
+other AUR inputs are reviewed; makepkg's own `src/` and `pkg/` work
+directories (extracted upstream sources and build output) are not, so upstream
+sources and whatever `prepare()`/`build()` do with them are outside the review.
+
+### Omarchy themes
+
+The Bash interceptor routes `omarchy theme install` and `omarchy theme update`
+through Guardian. Themes are cloned to a hidden staging directory and
+reviewed; only the exact reviewed checkout is moved into place and applied.
+Updates stage and review every Git-installed theme before replacing any.
+Themes with local or ignored modifications, submodules, or unresolved Git LFS
+files are refused. Direct invocations of Omarchy binaries outside the
+interactive Bash wrapper are not intercepted.
+
+### Removal
+
+```sh
+yay --makepkg /usr/bin/makepkg --save -P --stats
+sudo pacman -R omarchy-guardian
+```
+
+Removing the package removes the hook link. Delete the marked Guardian line
+from `~/.bashrc` to stop theme interception.
+
+## Limitations
+
+A clean result only means the static checks, the configured AI provider and
+the available OSV data did not identify a problem in the files reviewed.
+Guardian can miss malicious behaviour and benign code can match a rule. It does
+not inspect compiled package payloads, cannot prove an installed binary was
+built from the reviewed source, and does not intercept direct downloads or
+`curl | sh`. The sandbox is optional and limited to a 120 s run.
+
+## Development
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+On a non-Linux workstation, check with
+`cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings`
+(the crate refuses to build for other systems). Local hooks run the same
+checks: `prek install` (see `.pre-commit-config.yaml`). CI builds and tests on
+an Arch Linux container.
+
+The integration gates (pacman hook, yay shim, theme install and update) have an
+end-to-end harness that runs the real scripts in a Bubblewrap sandbox with a
+throwaway `/usr` overlay, mock `makepkg`/`omarchy-theme-set`, a simulated pacman
+parent process and a throwaway `HOME`:
 
 ```sh
 cargo build --release
 bash tests/e2e/integration-gates.sh
 ```
 
-That harness runs the real integration scripts inside a Bubblewrap sandbox with
-the freshly built binary mounted at `/usr/local/bin/omarchy-guardian`, mock
-`makepkg`/`omarchy-theme-set` commands, and a throwaway `HOME`, so it installs
-nothing and never touches the live system. It needs `bwrap`, `bsdtar`, `git`,
-`flock`, `curl`, and a working `opencode` review; it exits `77` when OpenCode
-cannot run, because the gates are fail-closed on a failed AI review.
-
-## Pacman and yay integration
-
-The repository includes an opt-in Pacman pre-transaction hook and a yay
-`makepkg` shim:
-
-1. Install the Pacman hook and helper binaries with `cargo build --release`
-   followed by `sudo integrations/install-system-hook.sh`.
-2. Configure yay to use the Guardian shim for `makepkg`:
-
-   ```sh
-   yay --makepkg /usr/local/lib/omarchy-guardian/guardian-makepkg --save -P --stats
-   ```
-
-The Pacman hook runs before install/upgrade transactions and uses
-`AbortOnFail`. For repository sync installs it reviews the `.INSTALL`
-scriptlets in matching package archives from Pacman's standard cache. For
-`pacman -U` it reviews scriptlets in the exact package archive paths supplied
-to Pacman. The hook drops root privileges before invoking Guardian/OpenCode;
-transactions without an identifiable invoking user, package archive, or valid
-review are blocked.
-
-The yay shim runs Guardian against the AUR build directory before each
-`makepkg` invocation and only starts `makepkg` after a clean result. This means
-it reviews the checked-out PKGBUILD and other text already present in the build
-directory; it does not safely stage and review upstream source archives before
-makepkg downloads or executes build steps.
-
-These integrations do not inspect compiled package payloads or prove that an
-installed binary matches reviewed source. Pacman sync packages are binary
-artifacts, so this hook currently reviews their install scriptlets only. Direct
-downloads and arbitrary `curl | sh` commands are not intercepted. The system
-hook is opt-in and is not activated merely by building the project.
-
-The system installer adds an interactive Bash function so `omarchy theme install`
-and `omarchy theme update` pass through Guardian. Other Omarchy commands are
-forwarded to the stock dispatcher. Open a new Bash shell after installation for
-the function to load. Theme installs are cloned to a hidden staging directory
-and reviewed before the exact checkout is moved into the user theme directory
-and applied. Theme updates stage and review every Git-installed theme before
-replacing any of them; themes with local or ignored modifications are refused.
-Themes using Git submodules or unresolved Git LFS files fail closed. Direct
-invocations of Omarchy binaries outside the interactive Bash wrapper bypass
-this interception.
-
-The theme test uses a temporary `hyprland.lua` that tries to send an SSH private
-key to an external host. Guardian reports the credential access and shell
-execution and blocks a mocked installer; it does not change the active theme.
-
-To remove the system integration, restore yay's setting first with
-`yay --makepkg /usr/bin/makepkg --save -P --stats`, then remove
-`/etc/pacman.d/hooks/omarchy-guardian.hook` and
-`/usr/local/lib/omarchy-guardian/`. Remove the marked Guardian source line from
-`~/.bashrc` to disable theme command interception.
+It needs `bwrap` 0.9 or newer, `bsdtar`, `pacman`, `git`, `flock`, `curl` and a
+working `opencode`; it exits `77` when OpenCode cannot run, because every gate
+is fail-closed on a failed AI review.
