@@ -15,6 +15,7 @@ use crate::report::{Blocked, Decision, Report};
 use crate::review::{self, ReviewContext};
 use crate::sandbox;
 use crate::scan::{self, ScanConfig};
+use crate::setup;
 use crate::tools::OpenCode;
 
 const USAGE: &str = "\
@@ -24,6 +25,7 @@ Usage:
   omarchy-guardian sandbox [--hashes] [--profile PROFILE] <directory> -- <command> [args...]
   omarchy-guardian pacman-hook --pacman-pid PID --cwd DIR   (run by the pacman hook)
   omarchy-guardian config show [--class CLASS] | check | path
+  omarchy-guardian setup
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
 Exit codes: 0 clear or warned, 1 findings, 2 incomplete review, AI unavailable,
@@ -47,6 +49,7 @@ enum Invocation {
     Sandbox(Target, Vec<OsString>),
     PacmanHook(HookArgs),
     Config(ConfigCommand),
+    Setup,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -114,6 +117,13 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
         }
         Invocation::PacmanHook(hook) => pacman_hook_command(&hook, &settings),
         Invocation::Config(command) => config_command(&command, &settings),
+        Invocation::Setup => match setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("omarchy-guardian setup: {message}");
+                ExitCode::from(2)
+            }
+        },
     }
 }
 
@@ -345,6 +355,7 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         }
         Some("pacman-hook") => parse_hook(rest).map(Invocation::PacmanHook),
         Some("config") => parse_config(rest).map(Invocation::Config),
+        Some("setup") if rest.is_empty() => Ok(Invocation::Setup),
         _ => Err(format!("unknown command {:?}", command.to_string_lossy())),
     }
 }
@@ -816,5 +827,11 @@ mod tests {
         );
         assert!(parse(&args(&["config"])).is_err());
         assert!(parse(&args(&["config", "edit"])).is_err());
+    }
+
+    #[test]
+    fn parses_setup() {
+        assert_eq!(parse(&args(&["setup"])).unwrap(), Invocation::Setup);
+        assert!(parse(&args(&["setup", "extra"])).is_err());
     }
 }

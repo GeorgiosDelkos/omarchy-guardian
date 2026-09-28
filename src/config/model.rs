@@ -72,7 +72,6 @@ pub enum Profile {
 
 impl Profile {
     /// One line for the setup wizard and `config show`.
-    #[expect(dead_code, reason = "used by the setup wizard in Task 12")]
     pub const fn summary(self) -> &'static str {
         match self {
             Self::Standard => {

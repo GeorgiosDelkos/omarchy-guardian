@@ -107,7 +107,6 @@ pub enum AgentError {
 }
 
 impl AgentError {
-    #[expect(dead_code, reason = "used by the setup wizard in Task 12")]
     pub fn into_error(self) -> Error {
         match self {
             Self::Unavailable(error) | Self::Invalid(error) => error,

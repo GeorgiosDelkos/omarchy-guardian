@@ -30,6 +30,7 @@ mod review;
 mod rules;
 mod sandbox;
 mod scan;
+mod setup;
 mod sha256;
 #[cfg(test)]
 mod test_support;
