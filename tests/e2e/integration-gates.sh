@@ -126,6 +126,20 @@ expect() {
     fi
 }
 
+# expect_output <label> <pattern> <file>
+#
+# An exit code alone is shared by many failures; this pins the reason.
+expect_output() {
+    local label=$1 pattern=$2 file=$3
+    if grep -q -- "$pattern" "$file"; then
+        printf 'ok   %s\n' "$label"
+    else
+        printf 'FAIL %s: output did not contain %s: %s\n' "$label" "$pattern" \
+            "$(tr '\n' ';' <"$file")"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
 # Fails when a mock command was invoked, and always resets the mock log.
 expect_no_mock_run() {
     local label=$1
@@ -354,16 +368,22 @@ theme_gate() {
 settings_gate() {
     printf '=== settings and profiles ===\n'
     local user_config=$HOME/.config/omarchy-guardian/config.toml
+    local output=$E2E/settings-output
     mkdir -p "${user_config%/*}" "$E2E/etc-guardian"
+
+    # The official-package WARNED path is not covered here: the harness has no
+    # signed sync database, so every pacman -S target would be refused before
+    # classification.
 
     # A model OpenCode cannot resolve makes the AI review unavailable; the
     # AUR class requires it under the default profile, so the build blocks.
     printf '[agent]\nmodel = "guardian-e2e/does-not-exist"\n' >"$user_config"
     make_pkgbuild 'make'
-    run_shim "$E2E/build" --noconfirm >/dev/null 2>&1
+    run_shim "$E2E/build" --noconfirm >"$output" 2>&1
     # If this OpenCode version silently falls back to its default model
     # instead of failing, this check fails: report it rather than loosening it.
     expect 'AUR build blocks when the AI review is unavailable' 2 "$?"
+    expect_output 'the AUR block names the unavailable AI review' 'AI REVIEW UNAVAILABLE' "$output"
     expect_no_mock_run 'makepkg'
 
     # local-only never calls OpenCode and needs a confirmation that an
@@ -373,8 +393,9 @@ settings_gate() {
     rm -rf -- "$HOME/.config/omarchy/themes/good"
     make_theme good-theme 'local wallpaper = "/usr/share/backgrounds/omarchy/default.png"'
     printf 'profile = "local-only"\n' >"$user_config"
-    run_theme install "$E2E/sources/good-theme" </dev/null >/dev/null 2>&1
+    run_theme install "$E2E/sources/good-theme" </dev/null >"$output" 2>&1
     expect 'local-only theme install without a terminal is not confirmed' 2 "$?"
+    expect_output 'the theme block says it was not confirmed' 'NOT CONFIRMED' "$output"
     expect_no_mock_run 'omarchy-theme-set'
     rm -f -- "$user_config"
 
@@ -383,8 +404,9 @@ settings_gate() {
     printf '%s\n' guardian-good | sandbox "$E2E/pkg" \
         --overlay-src /etc --tmp-overlay /etc \
         --ro-bind "$E2E/etc-guardian/config.toml" /etc/omarchy-guardian/config.toml -- \
-        "$E2E/fakebin/pacman" -U "$E2E/packages/guardian-good-1-1-x86_64.pkg.tar.zst" >/dev/null 2>&1
+        "$E2E/fakebin/pacman" -U "$E2E/packages/guardian-good-1-1-x86_64.pkg.tar.zst" >"$output" 2>&1
     expect 'an insecure system config blocks the pacman gate' 2 "$?"
+    expect_output 'the pacman block points at config check' 'config check' "$output"
 }
 
 pacman_gate
