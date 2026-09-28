@@ -84,6 +84,14 @@ impl PartialConfig {
     }
 }
 
+/// A model is spelled `provider/model`, both parts non-empty, without
+/// whitespace.
+pub fn is_model_name(text: &str) -> bool {
+    text.split_once('/')
+        .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        && !text.contains(char::is_whitespace)
+}
+
 pub fn parse(file: &Path, text: &str) -> Result<PartialConfig, ConfigError> {
     let entries = tomlish::entries(text).map_err(|error| ConfigError {
         file: file.to_path_buf(),
@@ -219,11 +227,7 @@ impl Field<'_> {
 
     fn model(&self, value: Value) -> Result<String, ConfigError> {
         let text = self.text(value)?;
-        let valid = text
-            .split_once('/')
-            .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
-            && !text.contains(char::is_whitespace);
-        if valid {
+        if is_model_name(&text) {
             Ok(text)
         } else {
             Err(self.error("expected provider/model"))

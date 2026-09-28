@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::agent::{self, SourceFile, Status};
-use crate::config::file::parse;
+use crate::config::file::{is_model_name, parse};
 use crate::config::load::{self, SYSTEM_PATH};
 use crate::config::model::{AgentSettings, Named, Profile, SourceClass, Thinking, builtin};
 use crate::tools::{self, Limits, OpenCode};
@@ -146,8 +146,12 @@ fn choose_model(
     environment: &dyn Environment,
     question: &str,
 ) -> Result<Option<String>, String> {
-    let mut options: Vec<(Option<usize>, String)> = vec![(None, "OpenCode's default model".into())];
     let models = environment.models();
+    if models.is_empty() {
+        return ask_model(terminal, question);
+    }
+
+    let mut options: Vec<(Option<usize>, String)> = vec![(None, "OpenCode's default model".into())];
     options.extend(
         models
             .iter()
@@ -157,6 +161,29 @@ fn choose_model(
 
     let picked = pick(terminal, question, &options, 0)?;
     Ok(picked.map(|index| models[index].clone()))
+}
+
+/// Free-text fallback when `opencode models` lists nothing; empty keeps
+/// OpenCode's default model.
+fn ask_model(terminal: &mut dyn Terminal, question: &str) -> Result<Option<String>, String> {
+    loop {
+        let answer = terminal
+            .ask(&format!(
+                "{question}\nEnter provider/model (empty for OpenCode's default):"
+            ))
+            .ok_or("setup cancelled: no terminal input")?;
+        let answer = answer.trim();
+
+        if answer.is_empty() {
+            return Ok(None);
+        }
+        if is_model_name(answer) {
+            return Ok(Some(answer.to_string()));
+        }
+        terminal.say(
+            "Please enter the model as provider/model, for example anthropic/claude-sonnet-5.",
+        );
+    }
 }
 
 pub fn run(terminal: &mut dyn Terminal, environment: &dyn Environment) -> Result<(), String> {
@@ -584,6 +611,8 @@ mod tests {
     struct Fake {
         opencode: bool,
         test_passes: bool,
+        /// `opencode models` listed nothing.
+        no_models: bool,
         user_written: RefCell<Option<String>>,
         system_written: RefCell<Option<String>>,
         tested: RefCell<Vec<AgentSettings>>,
@@ -598,6 +627,9 @@ mod tests {
             false
         }
         fn models(&self) -> Vec<String> {
+            if self.no_models {
+                return Vec::new();
+            }
             vec![
                 "anthropic/claude-sonnet-5".into(),
                 "anthropic/claude-haiku-4-5".into(),
@@ -668,6 +700,41 @@ mod tests {
         let tested = vec![(Thinking::High, "high".to_string())];
         assert_eq!(user_config.agent.variants, tested);
         assert_eq!(system_config.agent.variants, tested);
+    }
+
+    #[test]
+    fn without_a_model_list_setup_accepts_a_typed_model() {
+        let environment = Fake {
+            opencode: true,
+            test_passes: true,
+            no_models: true,
+            ..Fake::default()
+        };
+        // profile (default), an invalid then a valid review model, official
+        // model empty (OpenCode default), thinking (default), confirm
+        let mut terminal = script(&["", "no-slash", "ollama/qwen3", "", "", "y"]);
+
+        run(&mut terminal, &environment).unwrap();
+
+        assert!(terminal.output.contains("Enter provider/model"));
+        assert!(
+            terminal
+                .output
+                .contains("Please enter the model as provider/model")
+        );
+        assert_eq!(
+            environment.tested.borrow()[0].model.as_deref(),
+            Some("ollama/qwen3")
+        );
+        let system = environment.system_written.borrow().clone().unwrap();
+        let system_config = parse(Path::new("system"), &system).unwrap();
+        assert_eq!(system_config.agent.model.as_deref(), Some("ollama/qwen3"));
+        assert_eq!(
+            system_config
+                .class(crate::config::model::SourceClass::Official)
+                .model,
+            None
+        );
     }
 
     #[test]
