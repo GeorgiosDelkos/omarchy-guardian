@@ -7,6 +7,7 @@
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -258,6 +259,29 @@ fn tune_agent(
     }
 }
 
+/// Renders both files, parses them back and requires the parsed model
+/// fields to exactly match what was selected. A model name containing `"`
+/// or `\` would otherwise still parse (for example truncated at the quote,
+/// with the rest read as a comment) as a *different*, unintended model
+/// instead of failing loudly.
+fn validate_rendered(choice: &Choice) -> Result<(String, String), String> {
+    let user_text = render_user(choice);
+    let system_text = render_system(choice);
+    let user_config =
+        parse(Path::new("user config"), &user_text).map_err(|error| error.to_string())?;
+    let system_config =
+        parse(Path::new("system config"), &system_text).map_err(|error| error.to_string())?;
+
+    let matches = user_config.agent.model == choice.model
+        && system_config.agent.model == choice.model
+        && system_config.class(SourceClass::Official).model == choice.official_model;
+    if matches {
+        Ok((user_text, system_text))
+    } else {
+        Err("rendered config does not match the selection; nothing was written".into())
+    }
+}
+
 /// Validates and writes the user file, then shows a diff of the system file
 /// and installs it with sudo only after explicit confirmation.
 fn write_files(
@@ -265,10 +289,7 @@ fn write_files(
     environment: &dyn Environment,
     choice: &Choice,
 ) -> Result<(), String> {
-    let user_text = render_user(choice);
-    let system_text = render_system(choice);
-    parse(Path::new("user config"), &user_text).map_err(|error| error.to_string())?;
-    parse(Path::new("system config"), &system_text).map_err(|error| error.to_string())?;
+    let (user_text, system_text) = validate_rendered(choice)?;
 
     let user_path = environment.write_user(&user_text)?;
     terminal.say(&format!("Wrote {}", user_path.display()));
@@ -330,9 +351,18 @@ impl Terminal for TtyTerminal {
         write!(tty, "{question} ").ok()?;
         tty.flush().ok()?;
 
-        let mut answer = String::new();
-        BufReader::new(tty).read_line(&mut answer).ok()?;
-        Some(answer)
+        read_answer(BufReader::new(tty))
+    }
+}
+
+/// `None` at end of input (for example Ctrl-D) or on a read error: a closed
+/// terminal must never be read as an empty answer, which would silently
+/// accept every remaining default and write the config.
+fn read_answer(mut reader: impl BufRead) -> Option<String> {
+    let mut answer = String::new();
+    match reader.read_line(&mut answer) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(answer),
     }
 }
 
@@ -370,7 +400,15 @@ impl Environment for RealEnvironment {
             String::from_utf8_lossy(&captured.stdout)
                 .lines()
                 .map(str::trim)
-                .filter(|line| line.contains('/') && !line.contains(char::is_whitespace))
+                .filter(|line| {
+                    line.contains('/')
+                        && !line.contains(char::is_whitespace)
+                        // `"` or `\` could be misread by the TOML parser (a comment or an
+                        // escape) once rendered; `validate_rendered` catches this too, but a
+                        // model name should never reach the picker in the first place.
+                        && !line.contains('"')
+                        && !line.contains('\\')
+                })
                 .map(str::to_string)
                 .collect()
         })
@@ -425,28 +463,48 @@ impl Environment for RealEnvironment {
     }
 
     fn write_system(&self, text: &str) -> Result<(), String> {
-        let temporary = std::env::temp_dir().join(format!(
-            "omarchy-guardian-system-{}.toml",
-            std::process::id()
-        ));
-        fs::write(&temporary, text).map_err(|error| error.to_string())?;
+        let path = load::user_config_path().ok_or("cannot find the user config directory")?;
+        let directory = path.parent().ok_or("invalid user config path")?;
+        fs::create_dir_all(directory).map_err(|error| error.to_string())?;
 
-        let status = Command::new("/usr/bin/sudo")
-            .args(["install", "-D", "-m", "0644", "-o", "root", "-g", "root"])
-            .arg(&temporary)
-            .arg(SYSTEM_PATH)
-            .status()
-            .map_err(|error| error.to_string());
+        let temporary = directory.join(format!(".system-config.{}.tmp", std::process::id()));
+        let result =
+            write_temporary(&temporary, text).and_then(|()| install_system_file(&temporary));
         drop(fs::remove_file(&temporary));
-
-        match status? {
-            status if status.success() => Ok(()),
-            status => Err(format!("sudo install exited with {status}")),
-        }
+        result
     }
 
     fn hook_enabled(&self) -> bool {
         Path::new("/etc/pacman.d/hooks/omarchy-guardian.hook").exists()
+    }
+}
+
+/// Creates `path` exclusively, in a directory only this user can write, so a
+/// local attacker cannot pre-create it (or a symlink at that name) to
+/// control what `sudo install` below copies into `/etc` — the pacman gate's
+/// trust root — then writes `text` with permissions only the owner can read.
+fn write_temporary(path: &Path, text: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
+fn install_system_file(temporary: &Path) -> Result<(), String> {
+    let status = Command::new("/usr/bin/sudo")
+        .args(["install", "-D", "-m", "0644", "-o", "root", "-g", "root"])
+        .arg(temporary)
+        .arg(SYSTEM_PATH)
+        .status()
+        .map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("sudo install exited with {status}"))
     }
 }
 
@@ -457,7 +515,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use super::{Choice, Environment, Terminal, render_system, render_user, run};
+    use super::{
+        Choice, Environment, Terminal, read_answer, render_system, render_user, run,
+        validate_rendered,
+    };
     use crate::config::file::parse;
     use crate::config::model::{AgentSettings, Profile, Thinking};
 
@@ -623,5 +684,23 @@ mod tests {
                 .as_deref(),
             Some("anthropic/claude-haiku-4-5")
         );
+    }
+
+    #[test]
+    fn read_answer_distinguishes_eof_from_an_empty_line() {
+        assert_eq!(read_answer(&b""[..]), None);
+        assert_eq!(read_answer(&b"\n"[..]), Some("\n".to_string()));
+        assert_eq!(read_answer(&b"2\n"[..]), Some("2\n".to_string()));
+    }
+
+    #[test]
+    fn a_quote_in_the_model_name_fails_validation_instead_of_corrupting_the_file() {
+        let choice = Choice {
+            profile: Profile::Standard,
+            model: Some("a/b\"#x".into()),
+            official_model: None,
+            thinking: Thinking::High,
+        };
+        assert!(validate_rendered(&choice).is_err());
     }
 }
