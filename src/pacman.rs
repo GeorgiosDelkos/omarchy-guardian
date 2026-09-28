@@ -13,8 +13,9 @@ use std::fs;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
+use crate::classify;
 use crate::config::Settings;
-use crate::config::model::{Named, SourceClass};
+use crate::config::model::{DEFAULT_MAX_INPUT_KIB, Named, SourceClass};
 use crate::error::{Error, IoContext};
 use crate::report::{Gap, Report};
 use crate::review;
@@ -54,23 +55,33 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
     let operation = parse_operation(&argv)?;
 
     let mut report = Report::new("pacman transaction");
-    // Until each target is classified, judge everything as the strictest
+    // Untagged files (a class-lookup miss) are judged as the strictest
     // pacman class.
     report.class = SourceClass::ThirdPartyRepo;
     report.profile = settings.system_profile().name().to_string();
+    report.agent_input_limit = privileged_agent_input_limit(settings);
 
-    let archives = match operation {
-        Operation::Sync => sync_archives(&targets)?,
-        Operation::LocalUpgrade => local_archives(&argv, &args.cwd)?,
+    let (archives, classes) = match operation {
+        Operation::Sync => sync_archives(&targets, settings)?,
+        Operation::LocalUpgrade => (local_archives(&argv, &args.cwd)?, HashMap::new()),
     };
 
     for target in &targets {
+        let class = match operation {
+            Operation::Sync => classes
+                .get(target)
+                .copied()
+                .unwrap_or(SourceClass::ThirdPartyRepo),
+            Operation::LocalUpgrade => SourceClass::LocalPackage,
+        };
         match archives.get(target) {
             Some(Ok(paths)) => {
                 for archive in paths {
                     match scan_install_script(archive, target, &mut report) {
-                        Ok(true) => {}
-                        Ok(false) => {
+                        Ok(Some(rel)) => {
+                            report.file_classes.insert(rel, class);
+                        }
+                        Ok(None) => {
                             println!("Pacman package {target}: no install scriptlet to review.");
                         }
                         Err(error) => report.gaps.push(Gap::Package(error)),
@@ -88,6 +99,22 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
 
     review::run_agents(&mut report, settings, &args.opencode);
     Ok(report)
+}
+
+/// The pacman hook's report spans a whole transaction, not one source
+/// class, so it takes the largest AI input limit among the privileged
+/// classes a target can resolve to: this is how a system-file
+/// `[agent] max_input_kib` takes effect in the hook.
+fn privileged_agent_input_limit(settings: &Settings) -> usize {
+    [
+        SourceClass::Official,
+        SourceClass::ThirdPartyRepo,
+        SourceClass::LocalPackage,
+    ]
+    .into_iter()
+    .map(|class| settings.agent_settings(class).max_input_bytes)
+    .max()
+    .unwrap_or(DEFAULT_MAX_INPUT_KIB as usize * 1024)
 }
 
 fn read_targets(input: impl BufRead) -> Result<Vec<String>, Error> {
@@ -215,9 +242,21 @@ fn local_archives(argv: &[String], cwd: &Path) -> Result<Archives, Error> {
     Ok(archives)
 }
 
+/// One repository's offer of a package: the version pacman would install and
+/// the repository offering it, which decides the package's source class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncCandidate {
+    pub version_arch: String,
+    pub repo: String,
+}
+
 /// For `-S`: the archive of each target's sync-database version in pacman's
-/// cache directories, read once and indexed by file name.
-fn sync_archives(targets: &[String]) -> Result<Archives, Error> {
+/// cache directories, read once and indexed by file name, plus each target's
+/// source class as decided by the repository offering it.
+fn sync_archives(
+    targets: &[String],
+    settings: &Settings,
+) -> Result<(Archives, HashMap<String, SourceClass>), Error> {
     let versions = sync_versions(targets)?;
     let cache = cache_index(&cache_directories()?)?;
     let mut archives = Archives::new();
@@ -232,7 +271,8 @@ fn sync_archives(targets: &[String]) -> Result<Archives, Error> {
         };
 
         let mut found = Vec::new();
-        for version_arch in candidates {
+        for candidate in candidates {
+            let version_arch = &candidate.version_arch;
             for extension in ARCHIVE_EXTENSIONS {
                 if let Some(path) = cache.get(&format!("{target}-{version_arch}{extension}")) {
                     found.push(path.clone());
@@ -256,12 +296,37 @@ fn sync_archives(targets: &[String]) -> Result<Archives, Error> {
         };
         archives.insert(target.clone(), entry);
     }
-    Ok(archives)
+
+    let official_repos = settings.official_repos();
+    // Every candidate repo's SigLevel is queried at most once per
+    // transaction, since `pacman-conf` is one process invocation.
+    let mut siglevels: HashMap<String, bool> = HashMap::new();
+    let mut classes = HashMap::new();
+    for (target, candidates) in &versions {
+        let mut candidate_classes = Vec::new();
+        for candidate in candidates {
+            let required = if let Some(required) = siglevels.get(&candidate.repo) {
+                *required
+            } else {
+                let required = classify::requires_signatures(&classify::siglevel(&candidate.repo)?);
+                siglevels.insert(candidate.repo.clone(), required);
+                required
+            };
+            candidate_classes.push(classify::repo_class(
+                &candidate.repo,
+                &official_repos,
+                required,
+            ));
+        }
+        classes.insert(target.clone(), classify::strictest(candidate_classes));
+    }
+
+    Ok((archives, classes))
 }
 
-/// `name → ["version-arch", ...]` from `pacman -Si`. A package present in
-/// several repositories yields several candidates.
-fn sync_versions(targets: &[String]) -> Result<HashMap<String, Vec<String>>, Error> {
+/// `name → [candidate, ...]` from `pacman -Si`. A package present in several
+/// repositories yields several candidates.
+fn sync_versions(targets: &[String]) -> Result<HashMap<String, Vec<SyncCandidate>>, Error> {
     let mut args: Vec<OsString> = vec!["-Si".into(), "--".into()];
     args.extend(targets.iter().map(OsString::from));
     // Unknown targets make pacman exit non-zero while still printing the
@@ -270,20 +335,24 @@ fn sync_versions(targets: &[String]) -> Result<HashMap<String, Vec<String>>, Err
     Ok(parse_sync_info(&String::from_utf8_lossy(&captured.stdout)))
 }
 
-pub fn parse_sync_info(output: &str) -> HashMap<String, Vec<String>> {
-    let mut versions: HashMap<String, Vec<String>> = HashMap::new();
+pub fn parse_sync_info(output: &str) -> HashMap<String, Vec<SyncCandidate>> {
+    let mut versions: HashMap<String, Vec<SyncCandidate>> = HashMap::new();
     let mut fields: HashMap<&str, &str> = HashMap::new();
 
     let mut flush = |fields: &mut HashMap<&str, &str>| {
-        if let (Some(name), Some(version), Some(arch)) = (
+        if let (Some(name), Some(version), Some(arch), Some(repo)) = (
             fields.get("Name"),
             fields.get("Version"),
             fields.get("Architecture"),
+            fields.get("Repository"),
         ) {
             versions
                 .entry((*name).to_string())
                 .or_default()
-                .push(format!("{version}-{arch}"));
+                .push(SyncCandidate {
+                    version_arch: format!("{version}-{arch}"),
+                    repo: (*repo).to_string(),
+                });
         }
         fields.clear();
     };
@@ -370,12 +439,13 @@ fn package_name(archive: &Path) -> Result<String, Error> {
 }
 
 /// Extracts `.INSTALL` directly (no listing, which is unbounded for packages
-/// with many files). Returns whether the archive had a scriptlet.
+/// with many files). Returns the virtual path it was reviewed under, or
+/// `None` when the archive had no scriptlet.
 pub fn scan_install_script(
     archive: &Path,
     target: &str,
     report: &mut Report,
-) -> Result<bool, Error> {
+) -> Result<Option<String>, Error> {
     let captured = tools::run(
         Path::new(tools::BSDTAR),
         &["-xOqf".into(), archive.into(), ".INSTALL".into()],
@@ -388,7 +458,7 @@ pub fn scan_install_script(
     )?;
     if !captured.status.success() {
         if String::from_utf8_lossy(&captured.stderr).contains("Not found in archive") {
-            return Ok(false);
+            return Ok(None);
         }
         return Err(Error::ToolFailed {
             tool: "bsdtar".into(),
@@ -406,13 +476,9 @@ pub fn scan_install_script(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("package");
-    review::analyze_text(
-        report,
-        &format!("{target}/{archive_name}/.INSTALL"),
-        &contents,
-        false,
-    );
-    Ok(true)
+    let rel = format!("{target}/{archive_name}/.INSTALL");
+    review::analyze_text(report, &rel, &contents, false);
+    Ok(Some(rel))
 }
 
 #[cfg(test)]
@@ -423,9 +489,14 @@ mod tests {
 
     use super::{
         Operation, is_valid_package_name, local_archives, parse_operation, parse_sync_info,
-        read_targets, scan_install_script, split_cmdline,
+        privileged_agent_input_limit, read_targets, scan_install_script, split_cmdline,
     };
-    use crate::report::Report;
+    use crate::agent::{AgentReview, Status};
+    use crate::config::Settings;
+    use crate::config::file::{AgentDefaults, PartialConfig};
+    use crate::config::model::SourceClass;
+    use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Report};
+    use crate::review::analyze_text;
     use crate::rules::RuleId;
     use crate::test_support::{TempDir, tool_available};
 
@@ -478,10 +549,101 @@ mod tests {
 
     #[test]
     fn parses_sync_database_versions() {
-        let output = "Repository      : core\nName            : linux\nVersion         : 6.10.1.arch1-1\nDescription     : The Linux kernel: and modules\nArchitecture    : x86_64\n\nRepository      : extra\nName            : ttf-font\nVersion         : 2:1.0-3\nArchitecture    : any\n";
+        let output = "Repository      : core\nName            : linux\nVersion         : 6.10.1.arch1-1\nDescription     : The Linux kernel: and modules\nArchitecture    : x86_64\n\nRepository      : chaotic-aur\nName            : ttf-font\nVersion         : 2:1.0-3\nArchitecture    : any\n";
         let versions = parse_sync_info(output);
-        assert_eq!(versions["linux"], ["6.10.1.arch1-1-x86_64"]);
-        assert_eq!(versions["ttf-font"], ["2:1.0-3-any"]);
+        assert_eq!(versions["linux"][0].version_arch, "6.10.1.arch1-1-x86_64");
+        assert_eq!(versions["linux"][0].repo, "core");
+        assert_eq!(versions["ttf-font"][0].version_arch, "2:1.0-3-any");
+        assert_eq!(versions["ttf-font"][0].repo, "chaotic-aur");
+    }
+
+    #[test]
+    fn agent_input_limit_follows_the_system_files_agent_defaults() {
+        let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default());
+        assert_eq!(privileged_agent_input_limit(&settings), 256 * 1024);
+
+        let system = PartialConfig {
+            agent: AgentDefaults {
+                max_input_kib: Some(64),
+                ..AgentDefaults::default()
+            },
+            ..PartialConfig::default()
+        };
+        let settings = Settings::from_parts(system, PartialConfig::default());
+        assert_eq!(privileged_agent_input_limit(&settings), 64 * 1024);
+    }
+
+    fn clear_run(files: &[&str]) -> AgentRun {
+        AgentRun {
+            files: files.iter().map(ToString::to_string).collect(),
+            label: "m · low".into(),
+            outcome: AgentOutcome::Reviewed(AgentReview {
+                status: Status::Clear,
+                summary: "ok".into(),
+                findings: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn mixed_transaction_uses_each_targets_policy() {
+        let settings = Settings::from_parts(PartialConfig::default(), PartialConfig::default());
+        let policy = |class| settings.policy(class);
+
+        let mut report = Report::new("pacman transaction");
+        report.class = SourceClass::ThirdPartyRepo;
+        report
+            .file_classes
+            .insert("core-pkg/a/.INSTALL".into(), SourceClass::Official);
+        report
+            .file_classes
+            .insert("chaotic-pkg/b/.INSTALL".into(), SourceClass::ThirdPartyRepo);
+        analyze_text(
+            &mut report,
+            "core-pkg/a/.INSTALL",
+            "post_install() { setcap cap_net_raw+ep /usr/bin/x; }\n",
+            false,
+        );
+        analyze_text(
+            &mut report,
+            "chaotic-pkg/b/.INSTALL",
+            "post_install() { true; }\n",
+            false,
+        );
+        report.agent_runs.push(clear_run(&[
+            "core-pkg/a/.INSTALL",
+            "chaotic-pkg/b/.INSTALL",
+        ]));
+        assert_eq!(report.decide(&policy), Decision::Warned);
+
+        let mut flagged = Report::new("pacman transaction");
+        flagged.class = SourceClass::ThirdPartyRepo;
+        flagged
+            .file_classes
+            .insert("core-pkg/a/.INSTALL".into(), SourceClass::Official);
+        flagged
+            .file_classes
+            .insert("chaotic-pkg/b/.INSTALL".into(), SourceClass::ThirdPartyRepo);
+        analyze_text(
+            &mut flagged,
+            "core-pkg/a/.INSTALL",
+            "post_install() { true; }\n",
+            false,
+        );
+        analyze_text(
+            &mut flagged,
+            "chaotic-pkg/b/.INSTALL",
+            "post_install() { setcap cap_net_raw+ep /usr/bin/x; }\n",
+            false,
+        );
+        flagged.agent_runs.push(clear_run(&[
+            "core-pkg/a/.INSTALL",
+            "chaotic-pkg/b/.INSTALL",
+        ]));
+        assert_eq!(
+            flagged.decide(&policy),
+            Decision::Blocked(Blocked::Findings)
+        );
     }
 
     #[test]
@@ -545,7 +707,12 @@ mod tests {
         let archive = build_package(dir.path(), Some("post_install() { rm -rf /; }\n"));
 
         let mut report = Report::new("test");
-        assert!(scan_install_script(&archive, "sample", &mut report).unwrap());
+        assert_eq!(
+            scan_install_script(&archive, "sample", &mut report)
+                .unwrap()
+                .as_deref(),
+            Some("sample/sample-1.0-1-any.pkg.tar/.INSTALL")
+        );
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].rule, RuleId::DestructiveSystemOperation);
         assert_eq!(
@@ -556,6 +723,9 @@ mod tests {
 
         let plain_dir = TempDir::new("pacman-plain");
         let plain = build_package(plain_dir.path(), None);
-        assert!(!scan_install_script(&plain, "sample", &mut Report::default()).unwrap());
+        assert_eq!(
+            scan_install_script(&plain, "sample", &mut Report::default()).unwrap(),
+            None
+        );
     }
 }

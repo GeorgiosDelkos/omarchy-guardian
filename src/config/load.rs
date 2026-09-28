@@ -14,10 +14,6 @@ use crate::config::resolve::{Layers, Resolved, resolve};
 
 pub const SYSTEM_PATH: &str = "/etc/omarchy-guardian/config.toml";
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used to classify pacman targets in Task 10")
-)]
 pub const DEFAULT_OFFICIAL_REPOS: [&str; 7] = [
     "core",
     "extra",
@@ -275,10 +271,6 @@ impl Settings {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used to classify pacman targets in Task 10")
-    )]
     pub fn official_repos(&self) -> Vec<String> {
         self.system.official_repos.clone().unwrap_or_else(|| {
             DEFAULT_OFFICIAL_REPOS
