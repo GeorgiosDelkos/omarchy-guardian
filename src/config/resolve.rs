@@ -1,0 +1,383 @@
+//! Combining profile, system file and user file into one policy per class
+//! (spec §6). For classes enforced by the root pacman hook the user layer
+//! may only tighten; everything it cannot apply is recorded, never dropped
+//! silently.
+
+use crate::config::file::PartialPolicy;
+use crate::config::model::{Named, Policy, Profile, SourceClass, builtin};
+
+pub const KNOBS: [&str; 7] = [
+    "ai",
+    "on_findings",
+    "on_ai_suspicious",
+    "thinking",
+    "model",
+    "timeout_secs",
+    "confirm",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Profile,
+    System,
+    User,
+}
+
+impl Origin {
+    #[expect(dead_code, reason = "wired into the CLI in Task 9")]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::System => "system",
+            Self::User => "user",
+        }
+    }
+}
+
+pub struct Layers<'a> {
+    pub system_profile: Profile,
+    pub system: &'a PartialPolicy,
+    pub user_profile: Option<Profile>,
+    pub user: &'a PartialPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub policy: Policy,
+    pub origins: Vec<(&'static str, Origin)>,
+    /// User values that were not applied, with the reason.
+    pub ignored: Vec<String>,
+}
+
+impl Resolved {
+    pub fn origin(&self, knob: &str) -> Origin {
+        self.origins
+            .iter()
+            .find(|(name, _)| *name == knob)
+            .map_or(Origin::Profile, |(_, origin)| *origin)
+    }
+
+    fn from_profile(profile: Profile, class: SourceClass) -> Self {
+        Self {
+            policy: builtin(profile, class),
+            origins: KNOBS.iter().map(|knob| (*knob, Origin::Profile)).collect(),
+            ignored: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, knob: &'static str, origin: Origin) {
+        if let Some(entry) = self.origins.iter_mut().find(|(name, _)| *name == knob) {
+            entry.1 = origin;
+        }
+    }
+
+    /// Unconditional override (system layer, or user layer for user-level classes).
+    fn apply(&mut self, values: &PartialPolicy, origin: Origin) {
+        if let Some(ai) = values.ai {
+            self.policy.ai = ai;
+            self.mark("ai", origin);
+        }
+        if let Some(action) = values.on_findings {
+            self.policy.on_findings = action;
+            self.mark("on_findings", origin);
+        }
+        if let Some(action) = values.on_ai_suspicious {
+            self.policy.on_ai_suspicious = action;
+            self.mark("on_ai_suspicious", origin);
+        }
+        if let Some(thinking) = values.thinking {
+            self.policy.thinking = thinking;
+            self.mark("thinking", origin);
+        }
+        if let Some(model) = &values.model {
+            self.policy.model = Some(model.clone());
+            self.mark("model", origin);
+        }
+        if let Some(timeout) = values.timeout_secs {
+            self.policy.timeout_secs = Some(timeout);
+            self.mark("timeout_secs", origin);
+        }
+        if let Some(confirm) = values.confirm {
+            self.policy.confirm = confirm;
+            self.mark("confirm", origin);
+        }
+    }
+
+    /// Tighten-only override for privileged classes.
+    fn tighten(&mut self, values: &PartialPolicy, source: &str) {
+        tighten_knob(
+            &mut self.policy.ai,
+            values.ai,
+            "ai",
+            source,
+            &mut self.origins,
+            &mut self.ignored,
+        );
+        tighten_knob(
+            &mut self.policy.on_findings,
+            values.on_findings,
+            "on_findings",
+            source,
+            &mut self.origins,
+            &mut self.ignored,
+        );
+        tighten_knob(
+            &mut self.policy.on_ai_suspicious,
+            values.on_ai_suspicious,
+            "on_ai_suspicious",
+            source,
+            &mut self.origins,
+            &mut self.ignored,
+        );
+        tighten_knob(
+            &mut self.policy.thinking,
+            values.thinking,
+            "thinking",
+            source,
+            &mut self.origins,
+            &mut self.ignored,
+        );
+
+        // Model and timeout for pacman-enforced classes come only from the
+        // system file; the user layer can never supply them, tighter or not.
+        if let Some(model) = &values.model {
+            self.ignored.push(format!(
+                "model = {model} ignored ({source}): models for pacman-enforced classes come only from the system file"
+            ));
+        }
+        if let Some(timeout) = values.timeout_secs {
+            self.ignored.push(format!(
+                "timeout_secs = {timeout} ignored ({source}): only the system file sets it for pacman-enforced classes"
+            ));
+        }
+    }
+}
+
+fn tighten_knob<T: Named + Ord>(
+    slot: &mut T,
+    candidate: Option<T>,
+    knob: &'static str,
+    source: &str,
+    origins: &mut [(&'static str, Origin)],
+    ignored: &mut Vec<String>,
+) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+
+    if candidate < *slot {
+        ignored.push(format!(
+            "{knob} = {} ignored ({source}): looser than {} for a pacman-enforced class",
+            candidate.name(),
+            slot.name()
+        ));
+        return;
+    }
+
+    if candidate > *slot {
+        *slot = candidate;
+        if let Some(entry) = origins.iter_mut().find(|(name, _)| *name == knob) {
+            entry.1 = Origin::User;
+        }
+    }
+}
+
+pub fn resolve(class: SourceClass, layers: &Layers<'_>) -> Resolved {
+    if class.is_privileged() {
+        let mut resolved = Resolved::from_profile(layers.system_profile, class);
+        resolved.apply(layers.system, Origin::System);
+
+        if let Some(profile) = layers.user_profile {
+            let profile_values = as_partial(&builtin(profile, class));
+            resolved.tighten(&profile_values, &format!("user profile {}", profile.name()));
+        }
+        resolved.tighten(layers.user, "user file");
+
+        resolved
+    } else {
+        let profile = layers.user_profile.unwrap_or(layers.system_profile);
+        let mut resolved = Resolved::from_profile(profile, class);
+        resolved.apply(layers.system, Origin::System);
+        resolved.apply(layers.user, Origin::User);
+
+        resolved
+    }
+}
+
+/// A built-in policy's tightenable knobs as explicit values.
+fn as_partial(policy: &Policy) -> PartialPolicy {
+    PartialPolicy {
+        ai: Some(policy.ai),
+        on_findings: Some(policy.on_findings),
+        on_ai_suspicious: Some(policy.on_ai_suspicious),
+        thinking: Some(policy.thinking),
+        model: None,
+        timeout_secs: None,
+        confirm: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Layers, Origin, resolve};
+    use crate::config::file::PartialPolicy;
+    use crate::config::model::{
+        Action, AiRequirement, Named, Profile, SourceClass, Thinking, builtin,
+    };
+
+    fn layers<'a>(
+        system_profile: Profile,
+        system: &'a PartialPolicy,
+        user_profile: Option<Profile>,
+        user: &'a PartialPolicy,
+    ) -> Layers<'a> {
+        Layers {
+            system_profile,
+            system,
+            user_profile,
+            user,
+        }
+    }
+
+    #[test]
+    fn user_level_classes_take_user_values() {
+        let system = PartialPolicy {
+            thinking: Some(Thinking::Medium),
+            ..PartialPolicy::default()
+        };
+        let user = PartialPolicy {
+            ai: Some(AiRequirement::Off),
+            model: Some("ollama/qwen3".into()),
+            ..PartialPolicy::default()
+        };
+
+        let resolved = resolve(
+            SourceClass::Theme,
+            &layers(Profile::Standard, &system, Some(Profile::Strict), &user),
+        );
+
+        assert_eq!(resolved.policy.ai, AiRequirement::Off);
+        assert_eq!(resolved.policy.thinking, Thinking::Medium);
+        assert_eq!(resolved.policy.on_findings, Action::Block);
+        assert_eq!(resolved.policy.model.as_deref(), Some("ollama/qwen3"));
+        assert_eq!(resolved.origin("ai"), Origin::User);
+        assert_eq!(resolved.origin("thinking"), Origin::System);
+        assert_eq!(resolved.origin("on_findings"), Origin::Profile);
+        assert!(resolved.ignored.is_empty());
+    }
+
+    #[test]
+    fn user_cannot_loosen_privileged_classes() {
+        let empty = PartialPolicy::default();
+        let user = PartialPolicy {
+            ai: Some(AiRequirement::Off),
+            on_findings: Some(Action::Block),
+            thinking: Some(Thinking::Minimal),
+            model: Some("evil/model".into()),
+            timeout_secs: Some(900),
+            ..PartialPolicy::default()
+        };
+
+        let resolved = resolve(
+            SourceClass::Official,
+            &layers(Profile::Standard, &empty, None, &user),
+        );
+
+        assert_eq!(resolved.policy.ai, AiRequirement::Optional);
+        assert_eq!(resolved.policy.on_findings, Action::Block);
+        assert_eq!(resolved.policy.thinking, Thinking::Low);
+        assert_eq!(resolved.policy.model, None);
+        assert_eq!(resolved.policy.timeout_secs, None);
+        assert_eq!(resolved.origin("on_findings"), Origin::User);
+        assert_eq!(resolved.ignored.len(), 4, "{:?}", resolved.ignored);
+        assert!(
+            resolved
+                .ignored
+                .iter()
+                .any(|line| line.starts_with("ai = off"))
+        );
+    }
+
+    #[test]
+    fn a_stricter_user_profile_tightens_privileged_classes() {
+        let empty = PartialPolicy::default();
+        let resolved = resolve(
+            SourceClass::Official,
+            &layers(Profile::Standard, &empty, Some(Profile::Strict), &empty),
+        );
+        assert_eq!(
+            resolved.policy,
+            builtin(Profile::Strict, SourceClass::Official)
+        );
+
+        let looser = resolve(
+            SourceClass::Official,
+            &layers(Profile::Strict, &empty, Some(Profile::LocalOnly), &empty),
+        );
+        assert_eq!(
+            looser.policy,
+            builtin(Profile::Strict, SourceClass::Official)
+        );
+        assert!(!looser.ignored.is_empty());
+    }
+
+    /// Spec §6: for privileged classes the result is never looser than the
+    /// system layer, for every knob and every value pair.
+    #[test]
+    fn tighten_only_is_exhaustive() {
+        let privileged = SourceClass::ALL
+            .iter()
+            .copied()
+            .filter(|class| class.is_privileged());
+
+        for class in privileged {
+            for system_profile in Profile::ALL.iter().copied() {
+                for &system_ai in AiRequirement::ALL {
+                    for &user_ai in AiRequirement::ALL {
+                        for &system_action in Action::ALL {
+                            for &user_action in Action::ALL {
+                                for &system_thinking in Thinking::ALL {
+                                    for &user_thinking in Thinking::ALL {
+                                        let system = PartialPolicy {
+                                            ai: Some(system_ai),
+                                            on_findings: Some(system_action),
+                                            on_ai_suspicious: Some(system_action),
+                                            thinking: Some(system_thinking),
+                                            ..PartialPolicy::default()
+                                        };
+                                        let user = PartialPolicy {
+                                            ai: Some(user_ai),
+                                            on_findings: Some(user_action),
+                                            on_ai_suspicious: Some(user_action),
+                                            thinking: Some(user_thinking),
+                                            ..PartialPolicy::default()
+                                        };
+                                        let policy = resolve(
+                                            class,
+                                            &layers(system_profile, &system, None, &user),
+                                        )
+                                        .policy;
+
+                                        assert_eq!(policy.ai, system_ai.max(user_ai));
+                                        assert_eq!(
+                                            policy.on_findings,
+                                            system_action.max(user_action)
+                                        );
+                                        assert_eq!(
+                                            policy.on_ai_suspicious,
+                                            system_action.max(user_action)
+                                        );
+                                        assert_eq!(
+                                            policy.thinking,
+                                            system_thinking.max(user_thinking)
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
