@@ -1,0 +1,417 @@
+//! Strict parsing of one config file (spec §6). Unknown keys, wrong types
+//! and out-of-range values are errors naming the file, line and key, so a
+//! typo never silently does nothing.
+
+use std::fmt;
+use std::ops::RangeInclusive;
+use std::path::{Path, PathBuf};
+
+use crate::config::model::{Action, AiRequirement, Named, Profile, SourceClass, Thinking};
+use crate::tomlish::{self, Entry, Value};
+
+pub const TIMEOUT_RANGE: RangeInclusive<u32> = 10..=900;
+pub const INPUT_KIB_RANGE: RangeInclusive<u32> = 16..=1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigError {
+    pub file: PathBuf,
+    pub line: usize,
+    /// Dotted key path; empty for syntax errors.
+    pub key: String,
+    pub message: String,
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}: ", self.file.display(), self.line)?;
+        if !self.key.is_empty() {
+            write!(f, "{}: ", self.key)?;
+        }
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartialPolicy {
+    pub ai: Option<AiRequirement>,
+    pub on_findings: Option<Action>,
+    pub on_ai_suspicious: Option<Action>,
+    pub thinking: Option<Thinking>,
+    pub model: Option<String>,
+    pub timeout_secs: Option<u32>,
+    pub confirm: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentDefaults {
+    pub model: Option<String>,
+    pub max_input_kib: Option<u32>,
+    /// Portable thinking level to provider variant name.
+    pub variants: Vec<(Thinking, String)>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartialConfig {
+    pub profile: Option<Profile>,
+    pub official_repos: Option<Vec<String>>,
+    pub agent: AgentDefaults,
+    pub classes: Vec<(SourceClass, PartialPolicy)>,
+}
+
+impl PartialConfig {
+    /// The explicit values for one class (empty when the file has none).
+    pub fn class(&self, class: SourceClass) -> PartialPolicy {
+        self.classes
+            .iter()
+            .find(|(candidate, _)| *candidate == class)
+            .map(|(_, policy)| policy.clone())
+            .unwrap_or_default()
+    }
+
+    fn class_mut(&mut self, class: SourceClass) -> &mut PartialPolicy {
+        if let Some(index) = self
+            .classes
+            .iter()
+            .position(|(candidate, _)| *candidate == class)
+        {
+            return &mut self.classes[index].1;
+        }
+        self.classes.push((class, PartialPolicy::default()));
+        let index = self.classes.len() - 1;
+        &mut self.classes[index].1
+    }
+}
+
+pub fn parse(file: &Path, text: &str) -> Result<PartialConfig, ConfigError> {
+    let entries = tomlish::entries(text).map_err(|error| ConfigError {
+        file: file.to_path_buf(),
+        line: error.line(),
+        key: String::new(),
+        message: error.to_string(),
+    })?;
+
+    let mut config = PartialConfig::default();
+    let mut seen: Vec<String> = Vec::new();
+
+    for entry in &entries {
+        let path = entry.full_path();
+        let key = path.join(".");
+        let field = Field {
+            file,
+            entry,
+            key: &key,
+        };
+
+        if entry.array_table {
+            return Err(field.error("array tables are not used in the config"));
+        }
+        if seen.contains(&key) {
+            return Err(field.error("set more than once"));
+        }
+        seen.push(key.clone());
+
+        let value = tomlish::typed_value(&entry.value).ok_or_else(|| {
+            field.error("unsupported value (use a string, integer, boolean or list of strings)")
+        })?;
+        apply(&mut config, &path, &field, value)?;
+    }
+    Ok(config)
+}
+
+fn apply(
+    config: &mut PartialConfig,
+    path: &[&str],
+    field: &Field<'_>,
+    value: Value,
+) -> Result<(), ConfigError> {
+    match path {
+        ["profile"] => config.profile = Some(field.named(value)?),
+        ["official_repos"] => config.official_repos = Some(field.repo_list(value)?),
+        ["agent", "model"] => config.agent.model = Some(field.model(value)?),
+        ["agent", "max_input_kib"] => {
+            config.agent.max_input_kib = Some(field.integer(&value, &INPUT_KIB_RANGE)?);
+        }
+        ["agent", "variants", level] => {
+            let level = Thinking::parse(level)
+                .filter(|level| *level != Thinking::Default)
+                .ok_or_else(|| field.error("variants map minimal, low, medium, high or max"))?;
+            config.agent.variants.push((level, field.text(value)?));
+        }
+        ["class", name, knob] => {
+            let class = SourceClass::parse(name).ok_or_else(|| {
+                field.error(&format!(
+                    "unknown source class (known: {})",
+                    names::<SourceClass>()
+                ))
+            })?;
+            apply_knob(config.class_mut(class), class, knob, field, value)?;
+        }
+        _ => return Err(field.error("unknown key")),
+    }
+    Ok(())
+}
+
+fn apply_knob(
+    policy: &mut PartialPolicy,
+    class: SourceClass,
+    knob: &str,
+    field: &Field<'_>,
+    value: Value,
+) -> Result<(), ConfigError> {
+    match knob {
+        "ai" => policy.ai = Some(field.named(value)?),
+        "on_findings" => policy.on_findings = Some(field.named(value)?),
+        "on_ai_suspicious" => policy.on_ai_suspicious = Some(field.named(value)?),
+        "thinking" => policy.thinking = Some(field.named(value)?),
+        "model" => policy.model = Some(field.model(value)?),
+        "timeout_secs" => policy.timeout_secs = Some(field.integer(&value, &TIMEOUT_RANGE)?),
+        "confirm" if class.is_privileged() => {
+            return Err(
+                field.error("confirm is not available for classes enforced by the pacman hook")
+            );
+        }
+        "confirm" => policy.confirm = Some(field.boolean(&value)?),
+        _ => return Err(field.error("unknown key")),
+    }
+    Ok(())
+}
+
+fn names<T: Named>() -> String {
+    T::ALL
+        .iter()
+        .map(|value| value.name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One entry being interpreted, for error construction.
+struct Field<'a> {
+    file: &'a Path,
+    entry: &'a Entry,
+    key: &'a str,
+}
+
+impl Field<'_> {
+    fn error(&self, message: &str) -> ConfigError {
+        ConfigError {
+            file: self.file.to_path_buf(),
+            line: self.entry.line,
+            key: self.key.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    fn text(&self, value: Value) -> Result<String, ConfigError> {
+        match value {
+            Value::String(text) if !text.trim().is_empty() => Ok(text),
+            Value::String(_) | Value::Integer(_) | Value::Bool(_) | Value::StringArray(_) => {
+                Err(self.error("expected a non-empty string"))
+            }
+        }
+    }
+
+    fn named<T: Named>(&self, value: Value) -> Result<T, ConfigError> {
+        let text = self.text(value)?;
+        T::parse(&text).ok_or_else(|| self.error(&format!("expected one of: {}", names::<T>())))
+    }
+
+    fn model(&self, value: Value) -> Result<String, ConfigError> {
+        let text = self.text(value)?;
+        let valid = text
+            .split_once('/')
+            .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
+            && !text.contains(char::is_whitespace);
+        if valid {
+            Ok(text)
+        } else {
+            Err(self.error("expected provider/model"))
+        }
+    }
+
+    fn integer(&self, value: &Value, range: &RangeInclusive<u32>) -> Result<u32, ConfigError> {
+        let out_of_range = || {
+            self.error(&format!(
+                "expected an integer from {} to {}",
+                range.start(),
+                range.end()
+            ))
+        };
+        match value {
+            Value::Integer(number) => u32::try_from(*number)
+                .ok()
+                .filter(|number| range.contains(number))
+                .ok_or_else(out_of_range),
+            Value::String(_) | Value::Bool(_) | Value::StringArray(_) => Err(out_of_range()),
+        }
+    }
+
+    fn boolean(&self, value: &Value) -> Result<bool, ConfigError> {
+        match value {
+            Value::Bool(flag) => Ok(*flag),
+            Value::String(_) | Value::Integer(_) | Value::StringArray(_) => {
+                Err(self.error("expected true or false"))
+            }
+        }
+    }
+
+    fn repo_list(&self, value: Value) -> Result<Vec<String>, ConfigError> {
+        let is_repo_name = |name: &str| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+        };
+        match value {
+            Value::StringArray(names) if names.iter().all(|name| is_repo_name(name)) => Ok(names),
+            Value::StringArray(_) | Value::String(_) | Value::Integer(_) | Value::Bool(_) => {
+                Err(self.error("expected a list of pacman repository names"))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{PartialPolicy, parse};
+    use crate::config::model::{Action, AiRequirement, Profile, SourceClass, Thinking};
+
+    const EXAMPLE: &str = r#"
+profile = "strict"
+official_repos = ["core", "extra"]
+
+[agent]
+model = "anthropic/claude-sonnet-5"
+max_input_kib = 512
+
+[agent.variants]
+max = "xhigh"
+
+[class.official]
+model = "anthropic/claude-haiku-4-5"
+thinking = "low"
+
+[class.aur]
+ai = "required"
+on_findings = "block"
+on_ai_suspicious = "warn"
+thinking = "max"
+timeout_secs = 300
+confirm = true
+"#;
+
+    fn parse_str(text: &str) -> Result<super::PartialConfig, super::ConfigError> {
+        parse(Path::new("/test/config.toml"), text)
+    }
+
+    #[test]
+    fn parses_every_supported_key() {
+        let config = parse_str(EXAMPLE).unwrap();
+
+        assert_eq!(config.profile, Some(Profile::Strict));
+        assert_eq!(
+            config.official_repos,
+            Some(vec!["core".into(), "extra".into()])
+        );
+        assert_eq!(
+            config.agent.model.as_deref(),
+            Some("anthropic/claude-sonnet-5")
+        );
+        assert_eq!(config.agent.max_input_kib, Some(512));
+        assert_eq!(
+            config.agent.variants,
+            [(Thinking::Max, "xhigh".to_string())]
+        );
+        assert_eq!(
+            config.class(SourceClass::Official),
+            PartialPolicy {
+                model: Some("anthropic/claude-haiku-4-5".into()),
+                thinking: Some(Thinking::Low),
+                ..PartialPolicy::default()
+            }
+        );
+        assert_eq!(
+            config.class(SourceClass::Aur),
+            PartialPolicy {
+                ai: Some(AiRequirement::Required),
+                on_findings: Some(Action::Block),
+                on_ai_suspicious: Some(Action::Warn),
+                thinking: Some(Thinking::Max),
+                model: None,
+                timeout_secs: Some(300),
+                confirm: Some(true),
+            }
+        );
+        assert_eq!(config.class(SourceClass::Theme), PartialPolicy::default());
+    }
+
+    #[test]
+    fn errors_name_the_line_and_key() {
+        let cases = [
+            ("profile = \"paranoid\"\n", 1, "profile"),
+            (
+                "\n[class.aur]\non_finding = \"block\"\n",
+                3,
+                "class.aur.on_finding",
+            ),
+            ("[class.nope]\nai = \"off\"\n", 2, "class.nope.ai"),
+            ("[agent]\nmax_input_kib = 4096\n", 2, "agent.max_input_kib"),
+            (
+                "[class.aur]\ntimeout_secs = 5\n",
+                2,
+                "class.aur.timeout_secs",
+            ),
+            ("[agent]\nmodel = \"no-slash\"\n", 2, "agent.model"),
+            (
+                "[agent.variants]\ndefault = \"x\"\n",
+                2,
+                "agent.variants.default",
+            ),
+            (
+                "[class.official]\nconfirm = true\n",
+                2,
+                "class.official.confirm",
+            ),
+            (
+                "official_repos = [\"core\", \"bad repo\"]\n",
+                1,
+                "official_repos",
+            ),
+            ("profile = 1\n", 1, "profile"),
+            ("[[class]]\nai = \"off\"\n", 2, "class.ai"),
+            (
+                "[class.aur]\nai = \"off\"\n[class.aur]\nai = \"required\"\n",
+                4,
+                "class.aur.ai",
+            ),
+            ("mystery = true\n", 1, "mystery"),
+        ];
+
+        for (text, line, key) in cases {
+            let error = parse_str(text).unwrap_err();
+            assert_eq!(
+                (error.line, error.key.as_str()),
+                (line, key),
+                "{text:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn syntax_errors_carry_the_line() {
+        let error = parse_str("profile = \"standard\"\n[agent\n").unwrap_err();
+        assert_eq!(error.line, 2);
+        assert!(error.to_string().starts_with("/test/config.toml:2: "));
+    }
+
+    #[test]
+    fn an_empty_file_is_valid() {
+        assert_eq!(
+            parse_str("# nothing\n").unwrap(),
+            super::PartialConfig::default()
+        );
+    }
+}
