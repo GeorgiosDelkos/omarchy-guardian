@@ -27,11 +27,114 @@ omarchy-guardian sandbox ./theme-checkout -- /usr/bin/true
   with the network isolated, no host home directory and a read-only system.
   It is a behaviour smoke test, not a dynamic malware detector.
 
-Exit codes: `0` clear (or a scriptlet-free pacman transaction), `1` findings,
-`2` incomplete review or usage error. Once `guard` or `sandbox` starts the
-command, the exit code is the command's own (128 + signal if it was killed).
-Guardian announces on stderr when it starts the command, so its own blocks can
-be told apart from the command's failures.
+Exit codes: `0` clear, warned or limited review (a scriptlet-free pacman
+transaction); `1` findings; `2` an incomplete review, an unavailable AI review
+under `ai = required`, a declined confirmation, or a usage error. Once `guard`
+or `sandbox` starts the command, the exit code is the command's own (128 +
+signal if it was killed). Guardian announces on stderr when it starts the
+command, so its own blocks can be told apart from the command's failures.
+
+## Profiles and settings
+
+Every review is tagged with the class of its source. Classes reviewed by the
+pacman hook are *privileged*: only the system file can loosen them.
+
+| Class | Source | Enforced by | Privileged |
+|---|---|---|---|
+| `official` | `pacman -S` from a repo in `official_repos` whose SigLevel requires signatures | pacman hook | yes |
+| `third-party-repo` | `pacman -S` from any other repo, signed or not | pacman hook | yes |
+| `local-package` | `pacman -U` archives | pacman hook | yes |
+| `aur` | yay makepkg shim | user | no |
+| `theme` | Omarchy theme install/update handler | user | no |
+| `plugin` | reserved for the coverage sub-project's plugin gate | user | no |
+| `source` | explicit `scan` / `guard` / `sandbox` (default) | user | no |
+
+`official_repos` defaults to `core, extra, multilib, core-testing,
+extra-testing, multilib-testing, omarchy` and is settable only in the system
+file.
+
+A profile is a named preset for every knob (`ai`, `on_findings`,
+`on_ai_suspicious`, `thinking`, `confirm`) of every class:
+
+| Profile | `official` | other classes |
+|---|---|---|
+| `standard` (default) | `ai = optional`, `thinking = low`, `on_findings = warn`, `on_ai_suspicious = block` | `ai = required`, `thinking = high`, `on_findings = block`, `on_ai_suspicious = block` |
+| `strict` | `ai = required`, `thinking = medium`, `on_findings = block`, `on_ai_suspicious = block` | `ai = required`, `thinking = max`, `on_findings = block`, `on_ai_suspicious = block` |
+| `local-only` | `ai = off`, `on_findings = warn` | `ai = off`, `on_findings = block`, plus `confirm = true` for user-level classes |
+
+`confirm` only applies with `ai = off`, on the user-level classes (the pacman
+hook has no reliable terminal): after clean local checks it asks on
+`/dev/tty` whether to proceed; no terminal or no explicit yes blocks the run.
+
+Settings come from two files of the same format:
+
+- system: `/etc/omarchy-guardian/config.toml`
+- user: `$XDG_CONFIG_HOME/omarchy-guardian/config.toml`, default
+  `~/.config/omarchy-guardian/config.toml`
+
+For the privileged classes, a user-file value for a knob applies only when it
+is at least as strict as the value from the profile and system file, and
+`model`, `[agent]`, `[agent.variants]` and `official_repos` are never taken
+from the user file at all for those classes. For the user-level classes, the
+user file's values apply directly, since those commands never reach the
+privileged pacman gate.
+
+```toml
+profile = "standard"             # standard | strict | local-only
+
+official_repos = ["core", "extra", "multilib", "omarchy"]   # system file only
+
+[agent]
+model = "anthropic/claude-sonnet-5"   # omit for OpenCode's default
+max_input_kib = 256                   # 16..=1024
+
+[agent.variants]                      # optional: portable level -> provider variant
+max = "xhigh"
+
+[class.official]
+model = "anthropic/claude-haiku-4-5"
+thinking = "low"
+
+[class.aur]
+thinking = "max"
+on_findings = "block"
+ai = "required"
+timeout_secs = 300
+```
+
+- `omarchy-guardian setup` — interactive wizard that detects OpenCode, lets
+  you choose a profile, model(s) and thinking level, runs a two-sample test
+  review, then writes the user file and (with confirmation) the root-owned
+  system file.
+- `omarchy-guardian config show [--class NAME]` — effective policy per class,
+  each value tagged `profile`, `system` or `user`, plus any ignored user
+  values and why.
+- `omarchy-guardian config check` — validates both files and the system
+  file's ownership; exit 0 valid, 2 invalid.
+- `omarchy-guardian config path` — prints both file paths.
+
+`scan` and `guard` take `--class NAME` (default `source`; one of the
+user-level classes `aur`, `theme`, `plugin`, `source`) to tag the review with
+its source class. `scan`, `guard` and `sandbox` take `--profile NAME`
+(`standard`, `strict`, `local-only`) to override the profile for that one run;
+it cannot affect a privileged class, because these commands never review one.
+The yay shim passes `--class aur`; the Omarchy theme handler passes
+`--class theme`.
+
+| Decision | Exit | When |
+|---|---|---|
+| `CLEAR` | 0 | nothing found, review complete |
+| `WARNED` | 0 | only findings whose policy is `warn`, or the AI review was unavailable under `ai = optional` |
+| `LIMITED REVIEW` | 0 | nothing reviewable (a scriptlet-free pacman transaction) |
+| `HIGH RISK` / `REVIEW REQUIRED` | 1 | any finding whose policy is `block` |
+| `INCOMPLETE` | 2 | any non-AI gap, or an invalid AI reply |
+| `AI REVIEW UNAVAILABLE` | 2 | the AI review was unavailable under `ai = required` |
+| `NOT CONFIRMED` | 2 | `confirm = true` and the user did not approve |
+
+Upgrading users on the default `standard` profile now get a `WARNED` result
+instead of a block when the AI review is unavailable for official
+Arch/Omarchy packages; set `profile = "strict"` in the system file to restore
+the old, always-blocking behaviour.
 
 ## What is checked
 
