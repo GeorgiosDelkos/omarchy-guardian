@@ -1,11 +1,14 @@
-//! Review results, the verdict derived from them, and their terminal rendering.
+//! Review results, the decision derived from them against a per-class
+//! policy, and their terminal rendering.
 
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
 use crate::agent::{AgentReview, SourceFile, Status};
+use crate::config::model::{Action, AiRequirement, Policy, SourceClass};
 use crate::deps::Inventory;
 use crate::error::Error;
 use crate::osv::Audit;
@@ -47,7 +50,7 @@ impl Severity {
 }
 
 /// A reason the review cannot vouch for what it was asked to review. Any gap
-/// makes the verdict `Incomplete`.
+/// blocks the decision as `Blocked(Incomplete)`.
 #[derive(Debug)]
 pub enum Gap {
     Io(Error),
@@ -99,22 +102,56 @@ impl fmt::Display for Gap {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    Clear,
+pub enum Blocked {
     Findings,
     Incomplete,
-    /// Nothing reviewable existed (a pacman transaction without scriptlets).
-    Limited,
+    AiUnavailable,
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired into the CLI in Task 9"))]
+    NotConfirmed,
 }
 
-impl Verdict {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Clear,
+    Warned,
+    /// Nothing reviewable existed (a pacman transaction without scriptlets).
+    Limited,
+    Blocked(Blocked),
+}
+
+impl Decision {
     pub fn exit_code(self) -> ExitCode {
         match self {
-            Self::Clear | Self::Limited => ExitCode::SUCCESS,
-            Self::Findings => ExitCode::from(1),
-            Self::Incomplete => ExitCode::from(2),
+            Self::Clear | Self::Warned | Self::Limited => ExitCode::SUCCESS,
+            Self::Blocked(Blocked::Findings) => ExitCode::from(1),
+            Self::Blocked(Blocked::Incomplete | Blocked::AiUnavailable | Blocked::NotConfirmed) => {
+                ExitCode::from(2)
+            }
         }
     }
+
+    /// Whether `guard` and `sandbox` may start their command.
+    pub const fn allows_running(self) -> bool {
+        match self {
+            Self::Clear | Self::Warned => true,
+            Self::Limited | Self::Blocked(_) => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum AgentOutcome {
+    Reviewed(AgentReview),
+    Unavailable(Error),
+}
+
+/// One OpenCode call and the files it covered.
+#[derive(Debug)]
+pub struct AgentRun {
+    pub files: Vec<String>,
+    /// `model · thinking`, from `AgentSettings::label`.
+    pub label: String,
+    pub outcome: AgentOutcome,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,7 +183,13 @@ pub struct Report {
     pub agent_input_overflowed: bool,
     pub dependencies: Inventory,
     pub audit: Option<Audit>,
-    pub agent: Option<AgentReview>,
+    /// Class of every file not listed in `file_classes`.
+    pub class: SourceClass,
+    /// Per-file classes when one report spans several (pacman transactions).
+    pub file_classes: HashMap<String, SourceClass>,
+    pub agent_runs: Vec<AgentRun>,
+    /// Profile name shown next to AI verdicts.
+    pub profile: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -170,6 +213,22 @@ impl Counts {
     }
 }
 
+#[derive(Default)]
+struct Tally {
+    ai_unavailable: bool,
+    blocked: bool,
+    warned: bool,
+}
+
+impl Tally {
+    fn apply(&mut self, action: Action) {
+        match action {
+            Action::Block => self.blocked = true,
+            Action::Warn => self.warned = true,
+        }
+    }
+}
+
 impl Report {
     pub fn new(subject: impl Into<String>) -> Self {
         Self {
@@ -178,25 +237,87 @@ impl Report {
         }
     }
 
-    pub fn verdict(&self) -> Verdict {
-        let agent_status = self.agent.as_ref().map(|review| review.status);
+    pub fn class_of(&self, path: &str) -> SourceClass {
+        self.file_classes.get(path).copied().unwrap_or(self.class)
+    }
 
-        if !self.gaps.is_empty() || agent_status == Some(Status::Inconclusive) {
-            Verdict::Incomplete
-        } else if !self.findings.is_empty()
-            || self
-                .audit
-                .as_ref()
-                .is_some_and(|audit| !audit.advisories.is_empty())
-            || self.agent.as_ref().is_some_and(|review| {
-                review.status == Status::Suspicious || !review.findings.is_empty()
-            })
+    fn run_classes(&self, run: &AgentRun) -> Vec<SourceClass> {
+        let mut classes: Vec<SourceClass> =
+            run.files.iter().map(|file| self.class_of(file)).collect();
+        classes.sort();
+        classes.dedup();
+        if classes.is_empty() {
+            classes.push(self.class);
+        }
+        classes
+    }
+
+    /// Spec §9. Precedence: incomplete, AI unavailable, findings, warned,
+    /// then limited or clear.
+    pub fn decide(&self, policy_for: &dyn Fn(SourceClass) -> Policy) -> Decision {
+        if !self.gaps.is_empty() {
+            return Decision::Blocked(Blocked::Incomplete);
+        }
+
+        let mut tally = Tally::default();
+        for run in &self.agent_runs {
+            let classes = self.run_classes(run);
+            match &run.outcome {
+                AgentOutcome::Unavailable(_) => {
+                    for class in classes {
+                        if policy_for(class).ai == AiRequirement::Required {
+                            tally.ai_unavailable = true;
+                        } else {
+                            tally.warned = true;
+                        }
+                    }
+                }
+                AgentOutcome::Reviewed(review) if review.status == Status::Inconclusive => {
+                    return Decision::Blocked(Blocked::Incomplete);
+                }
+                AgentOutcome::Reviewed(review) => {
+                    let mut flagged: Vec<SourceClass> = review
+                        .findings
+                        .iter()
+                        .flat_map(|finding| {
+                            if run.files.contains(&finding.file) {
+                                vec![self.class_of(&finding.file)]
+                            } else {
+                                classes.clone()
+                            }
+                        })
+                        .collect();
+                    if review.status == Status::Suspicious && flagged.is_empty() {
+                        flagged.clone_from(&classes);
+                    }
+                    for class in flagged {
+                        tally.apply(policy_for(class).on_ai_suspicious);
+                    }
+                }
+            }
+        }
+
+        for finding in &self.findings {
+            tally.apply(policy_for(self.class_of(&finding.path)).on_findings);
+        }
+        if self
+            .audit
+            .as_ref()
+            .is_some_and(|audit| !audit.advisories.is_empty())
         {
-            Verdict::Findings
-        } else if self.text_files_reviewed == 0 && self.agent.is_none() {
-            Verdict::Limited
+            tally.apply(policy_for(self.class).on_findings);
+        }
+
+        if tally.ai_unavailable {
+            Decision::Blocked(Blocked::AiUnavailable)
+        } else if tally.blocked {
+            Decision::Blocked(Blocked::Findings)
+        } else if tally.warned {
+            Decision::Warned
+        } else if self.text_files_reviewed == 0 && self.agent_runs.is_empty() {
+            Decision::Limited
         } else {
-            Verdict::Clear
+            Decision::Clear
         }
     }
 
@@ -206,7 +327,11 @@ impl Report {
         for finding in &self.findings {
             counts.add(finding.rule.severity());
         }
-        for finding in self.agent.iter().flat_map(|review| &review.findings) {
+        let agent_findings = self.agent_runs.iter().flat_map(|run| match &run.outcome {
+            AgentOutcome::Reviewed(review) => review.findings.as_slice(),
+            AgentOutcome::Unavailable(_) => &[],
+        });
+        for finding in agent_findings {
             counts.add(finding.severity);
         }
         for advisory in self.audit.iter().flat_map(|audit| &audit.advisories) {
@@ -229,54 +354,72 @@ impl Report {
             .count()
     }
 
-    pub fn print(&self, show_hashes: bool) {
+    pub fn print(&self, show_hashes: bool, decision: Decision) {
         let painter = Painter::for_stdout();
-        let verdict = self.verdict();
 
         println!("Omarchy Guardian  ·  {}", self.subject);
-        self.print_headline(verdict, painter);
+        self.print_headline(decision, painter);
         self.print_coverage(show_hashes, painter);
         self.print_inventory();
         self.print_agent_summary(painter);
-        self.print_findings(verdict, painter);
+        self.print_findings(decision, painter);
 
         for gap in &self.gaps {
             eprintln!("  ! {gap}");
         }
         println!(
             "\n{}",
-            match verdict {
-                Verdict::Findings => {
+            match decision {
+                Decision::Blocked(Blocked::Findings) => {
                     "Recommendation: do not install or run this source until findings are resolved."
                 }
-                Verdict::Incomplete => "Recommendation: do not proceed; complete the review first.",
-                Verdict::Limited => {
+                Decision::Blocked(Blocked::Incomplete) => {
+                    "Recommendation: do not proceed; complete the review first."
+                }
+                Decision::Blocked(Blocked::AiUnavailable) => {
+                    "Recommendation: fix the OpenCode setup (see `omarchy-guardian setup`) and retry."
+                }
+                Decision::Blocked(Blocked::NotConfirmed) => "Not confirmed; nothing was run.",
+                Decision::Warned => "Proceeding with warnings; read them above.",
+                Decision::Limited => {
                     "Scope: package payloads were not inspected by this scriptlet-only review."
                 }
-                Verdict::Clear =>
+                Decision::Clear =>
                     "Scope: this is a heuristic source review, not a safety guarantee.",
             }
         );
     }
 
-    fn print_headline(&self, verdict: Verdict, painter: Painter) {
+    fn print_headline(&self, decision: Decision, painter: Painter) {
         let counts = self.counts();
         let total = counts.total();
-        let (headline, color) = match verdict {
-            Verdict::Clear => ("✓ CLEAR — no known concerns found".to_string(), "32"),
-            Verdict::Findings if counts.high > 0 => (
+        let (headline, color) = match decision {
+            Decision::Clear => ("✓ CLEAR — no known concerns found".to_string(), "32"),
+            Decision::Warned => (
+                format!("! WARNED — {total} alert(s); allowed by policy for this source"),
+                "33;1",
+            ),
+            Decision::Blocked(Blocked::Findings) if counts.high > 0 => (
                 format!("✗ HIGH RISK — {total} alert(s) across local and AI review"),
                 "31;1",
             ),
-            Verdict::Findings => (
+            Decision::Blocked(Blocked::Findings) => (
                 format!("! REVIEW REQUIRED — {total} alert(s) across local and AI review"),
                 "33;1",
             ),
-            Verdict::Incomplete => (
+            Decision::Blocked(Blocked::Incomplete) => (
                 "! INCOMPLETE — this scan is not a clean result".to_string(),
                 "33;1",
             ),
-            Verdict::Limited => (
+            Decision::Blocked(Blocked::AiUnavailable) => (
+                "! AI REVIEW UNAVAILABLE — this source needs a completed AI review".to_string(),
+                "33;1",
+            ),
+            Decision::Blocked(Blocked::NotConfirmed) => (
+                "! NOT CONFIRMED — local checks passed but nothing was approved".to_string(),
+                "33;1",
+            ),
+            Decision::Limited => (
                 "· LIMITED REVIEW — no text install scripts were available".to_string(),
                 "36;1",
             ),
@@ -378,25 +521,37 @@ impl Report {
 
     fn print_agent_summary(&self, painter: Painter) {
         if self.agent_input_overflowed {
-            println!("OpenCode review: not run — source exceeds the 256 KiB input limit");
+            println!("OpenCode review: not run — source exceeds the AI input limit");
         }
-        if let Some(review) = &self.agent {
-            let color = match review.status {
-                Status::Clear => "32",
-                Status::Suspicious => "31;1",
-                Status::Inconclusive => "33;1",
-            };
-            println!(
-                "OpenCode: {} — {}",
-                painter.paint(review.status.label(), color),
-                review.summary
-            );
+        for run in &self.agent_runs {
+            match &run.outcome {
+                AgentOutcome::Reviewed(review) => {
+                    let color = match review.status {
+                        Status::Clear => "32",
+                        Status::Suspicious => "31;1",
+                        Status::Inconclusive => "33;1",
+                    };
+                    println!(
+                        "OpenCode: {} · {} · profile {} — {}",
+                        painter.paint(review.status.label(), color),
+                        run.label,
+                        self.profile,
+                        review.summary
+                    );
+                }
+                AgentOutcome::Unavailable(error) => println!(
+                    "OpenCode: {} · {} · profile {} — {error}",
+                    painter.paint("UNAVAILABLE", "33;1"),
+                    run.label,
+                    self.profile
+                ),
+            }
         }
     }
 
-    fn print_findings(&self, verdict: Verdict, painter: Painter) {
+    fn print_findings(&self, decision: Decision, painter: Painter) {
         if self.findings.is_empty() {
-            if verdict != Verdict::Limited {
+            if decision != Decision::Limited {
                 println!("Local checks: no matches");
             }
         } else {
@@ -417,13 +572,16 @@ impl Report {
             }
         }
 
-        if let Some(review) = self
-            .agent
-            .as_ref()
-            .filter(|review| !review.findings.is_empty())
-        {
-            println!("\nOpenCode findings:");
+        let mut findings_heading_printed = false;
+        for run in &self.agent_runs {
+            let AgentOutcome::Reviewed(review) = &run.outcome else {
+                continue;
+            };
             for finding in &review.findings {
+                if !findings_heading_printed {
+                    println!("\nOpenCode findings:");
+                    findings_heading_printed = true;
+                }
                 let line = finding
                     .line
                     .map(|line| format!(":{line}"))
@@ -492,95 +650,214 @@ impl Painter {
 
 #[cfg(test)]
 mod tests {
-    use super::{Gap, Painter, Report, Severity, Verdict};
+    use super::{AgentOutcome, AgentRun, Blocked, Decision, Gap, LocalFinding, Painter, Report};
     use crate::agent::{AgentFinding, AgentReview, Status};
+    use crate::config::model::{Profile, SourceClass, builtin};
+    use crate::error::Error;
     use crate::osv::{Advisory, Audit};
-    use crate::report::LocalFinding;
+    use crate::report::Severity;
     use crate::rules::RuleId;
 
-    fn review(status: Status) -> AgentReview {
-        AgentReview {
-            status,
-            summary: "summary".into(),
-            findings: Vec::new(),
+    fn standard(class: SourceClass) -> crate::config::model::Policy {
+        builtin(Profile::Standard, class)
+    }
+
+    fn reviewed(status: Status, files: &[&str]) -> AgentRun {
+        AgentRun {
+            files: files.iter().map(ToString::to_string).collect(),
+            label: "m · high".into(),
+            outcome: AgentOutcome::Reviewed(AgentReview {
+                status,
+                summary: "summary".into(),
+                findings: Vec::new(),
+            }),
+        }
+    }
+
+    fn unavailable(files: &[&str]) -> AgentRun {
+        AgentRun {
+            files: files.iter().map(ToString::to_string).collect(),
+            label: "m · high".into(),
+            outcome: AgentOutcome::Unavailable(Error::Refused("provider down".into())),
+        }
+    }
+
+    fn finding(path: &str) -> LocalFinding {
+        LocalFinding {
+            path: path.into(),
+            line: 1,
+            rule: RuleId::PrivilegeEscalation,
+            excerpt: String::new(),
+        }
+    }
+
+    fn report(class: SourceClass) -> Report {
+        Report {
+            class,
+            text_files_reviewed: 1,
+            ..Report::default()
         }
     }
 
     #[test]
     fn an_empty_scriptlet_review_is_limited() {
-        assert_eq!(Report::default().verdict(), Verdict::Limited);
+        assert_eq!(Report::default().decide(&standard), Decision::Limited);
     }
 
     #[test]
-    fn a_reviewed_tree_without_findings_is_clear() {
-        let report = Report {
-            text_files_reviewed: 1,
-            agent: Some(review(Status::Clear)),
-            ..Report::default()
-        };
-        assert_eq!(report.verdict(), Verdict::Clear);
+    fn a_clean_review_is_clear() {
+        let mut report = report(SourceClass::Aur);
+        report
+            .agent_runs
+            .push(reviewed(Status::Clear, &["PKGBUILD"]));
+        assert_eq!(report.decide(&standard), Decision::Clear);
     }
 
     #[test]
-    fn gaps_and_inconclusive_reviews_outrank_findings() {
-        let finding = LocalFinding {
-            path: "a.sh".into(),
-            line: 1,
-            rule: RuleId::DownloadAndExecute,
-            excerpt: String::new(),
-        };
+    fn official_proceeds_when_ai_is_unavailable_under_standard() {
+        let mut official = report(SourceClass::Official);
+        official.agent_runs.push(unavailable(&["a/.INSTALL"]));
+        assert_eq!(official.decide(&standard), Decision::Warned);
 
-        let mut report = Report {
-            text_files_reviewed: 1,
-            findings: vec![finding],
-            agent: Some(review(Status::Clear)),
-            ..Report::default()
-        };
-        assert_eq!(report.verdict(), Verdict::Findings);
-
-        report.agent = Some(review(Status::Inconclusive));
-        assert_eq!(report.verdict(), Verdict::Incomplete);
-
-        report.agent = Some(review(Status::Clear));
-        report.gaps.push(Gap::NoReviewableFiles);
-        assert_eq!(report.verdict(), Verdict::Incomplete);
+        let mut aur = report(SourceClass::Aur);
+        aur.agent_runs.push(unavailable(&["PKGBUILD"]));
+        assert_eq!(
+            aur.decide(&standard),
+            Decision::Blocked(Blocked::AiUnavailable)
+        );
     }
 
     #[test]
-    fn agent_findings_and_advisories_are_findings() {
-        let mut agent = review(Status::Clear);
-        agent.findings.push(AgentFinding {
-            severity: Severity::Low,
-            file: "a".into(),
-            line: None,
-            title: "t".into(),
-            reason: "r".into(),
+    fn local_findings_follow_on_findings() {
+        let mut official = report(SourceClass::Official);
+        official.findings.push(finding("a/.INSTALL"));
+        official
+            .agent_runs
+            .push(reviewed(Status::Clear, &["a/.INSTALL"]));
+        assert_eq!(official.decide(&standard), Decision::Warned);
+
+        let mut theme = report(SourceClass::Theme);
+        theme.findings.push(finding("hyprland.lua"));
+        theme
+            .agent_runs
+            .push(reviewed(Status::Clear, &["hyprland.lua"]));
+        assert_eq!(
+            theme.decide(&standard),
+            Decision::Blocked(Blocked::Findings)
+        );
+    }
+
+    #[test]
+    fn ai_suspicion_blocks_official_under_standard() {
+        let mut official = report(SourceClass::Official);
+        official
+            .agent_runs
+            .push(reviewed(Status::Suspicious, &["a/.INSTALL"]));
+        assert_eq!(
+            official.decide(&standard),
+            Decision::Blocked(Blocked::Findings)
+        );
+    }
+
+    #[test]
+    fn inconclusive_and_gaps_are_incomplete_in_every_profile() {
+        let lenient = |class| builtin(Profile::LocalOnly, class);
+
+        let mut inconclusive = report(SourceClass::Official);
+        inconclusive
+            .agent_runs
+            .push(reviewed(Status::Inconclusive, &["a"]));
+        assert_eq!(
+            inconclusive.decide(&lenient),
+            Decision::Blocked(Blocked::Incomplete)
+        );
+
+        let mut gap = report(SourceClass::Official);
+        gap.gaps.push(Gap::NoReviewableFiles);
+        assert_eq!(gap.decide(&lenient), Decision::Blocked(Blocked::Incomplete));
+    }
+
+    #[test]
+    fn findings_are_attributed_to_their_files_class() {
+        let mut mixed = report(SourceClass::ThirdPartyRepo);
+        mixed
+            .file_classes
+            .insert("core-pkg/.INSTALL".into(), SourceClass::Official);
+        mixed
+            .file_classes
+            .insert("chaotic-pkg/.INSTALL".into(), SourceClass::ThirdPartyRepo);
+
+        let mut run = reviewed(
+            Status::Suspicious,
+            &["core-pkg/.INSTALL", "chaotic-pkg/.INSTALL"],
+        );
+        if let AgentOutcome::Reviewed(review) = &mut run.outcome {
+            review.findings.push(AgentFinding {
+                severity: Severity::Medium,
+                file: "core-pkg/.INSTALL".into(),
+                line: None,
+                title: "t".into(),
+                reason: "r".into(),
+            });
+        }
+        mixed.agent_runs.push(run);
+
+        // Only the official file was named, and official blocks on AI
+        // suspicion under standard too, so this blocks either way; with a
+        // warn policy for official it must only warn.
+        let warn_official = |class| {
+            let mut policy = standard(class);
+            if class == SourceClass::Official {
+                policy.on_ai_suspicious = crate::config::model::Action::Warn;
+            }
+            policy
+        };
+        assert_eq!(mixed.decide(&warn_official), Decision::Warned);
+        assert_eq!(
+            mixed.decide(&standard),
+            Decision::Blocked(Blocked::Findings)
+        );
+    }
+
+    #[test]
+    fn advisories_follow_the_reports_class() {
+        let mut aur = report(SourceClass::Aur);
+        aur.agent_runs
+            .push(reviewed(Status::Clear, &["Cargo.lock"]));
+        aur.audit = Some(Audit {
+            advisories: vec![Advisory {
+                id: "GHSA-x".into(),
+                package: "p".into(),
+                version: "1".into(),
+                lockfile: "Cargo.lock".into(),
+                severity: None,
+                summary: None,
+            }],
+            truncated: false,
         });
-        let report = Report {
-            text_files_reviewed: 1,
-            agent: Some(agent),
-            ..Report::default()
-        };
-        assert_eq!(report.verdict(), Verdict::Findings);
+        assert_eq!(aur.decide(&standard), Decision::Blocked(Blocked::Findings));
+        assert_eq!(aur.counts().medium, 1);
+    }
 
-        let report = Report {
-            text_files_reviewed: 1,
-            agent: Some(review(Status::Clear)),
-            audit: Some(Audit {
-                advisories: vec![Advisory {
-                    id: "GHSA-x".into(),
-                    package: "p".into(),
-                    version: "1".into(),
-                    lockfile: "Cargo.lock".into(),
-                    severity: None,
-                    summary: None,
-                }],
-                truncated: false,
-            }),
-            ..Report::default()
-        };
-        assert_eq!(report.verdict(), Verdict::Findings);
-        assert_eq!(report.counts().medium, 1);
+    #[test]
+    fn decisions_map_to_exit_codes() {
+        use std::process::ExitCode;
+        assert_eq!(Decision::Clear.exit_code(), ExitCode::SUCCESS);
+        assert_eq!(Decision::Warned.exit_code(), ExitCode::SUCCESS);
+        assert_eq!(Decision::Limited.exit_code(), ExitCode::SUCCESS);
+        assert_eq!(
+            Decision::Blocked(Blocked::Findings).exit_code(),
+            ExitCode::from(1)
+        );
+        for blocked in [
+            Blocked::Incomplete,
+            Blocked::AiUnavailable,
+            Blocked::NotConfirmed,
+        ] {
+            assert_eq!(Decision::Blocked(blocked).exit_code(), ExitCode::from(2));
+        }
+        assert!(Decision::Warned.allows_running());
+        assert!(!Decision::Limited.allows_running());
     }
 
     #[test]

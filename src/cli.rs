@@ -6,12 +6,18 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
+use crate::config::model::{Policy, Profile, SourceClass, builtin};
 use crate::pacman::{self, HookArgs};
-use crate::report::Verdict;
 use crate::review;
 use crate::sandbox;
 use crate::scan::{self, ScanConfig};
 use crate::tools::OpenCode;
+
+/// Callers keep today's fail-closed behaviour until settings are wired in
+/// (Task 9).
+fn strict(class: SourceClass) -> Policy {
+    builtin(Profile::Strict, class)
+}
 
 const USAGE: &str = "\
 Usage:
@@ -57,8 +63,9 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
 
 fn scan_command(target: &Target) -> ExitCode {
     let report = review::review_tree(&target.config, &OpenCode::UserPath);
-    report.print(target.show_hashes);
-    report.verdict().exit_code()
+    let decision = report.decide(&strict);
+    report.print(target.show_hashes, decision);
+    decision.exit_code()
 }
 
 /// Reviews the target and hands `command` to `launch` only after a clear
@@ -70,12 +77,12 @@ fn guard_command(
     launch: &mut dyn FnMut(&[OsString]) -> ExitCode,
 ) -> ExitCode {
     let report = review::review_tree(&target.config, opencode);
-    report.print(target.show_hashes);
+    let decision = report.decide(&strict);
+    report.print(target.show_hashes, decision);
 
-    let verdict = report.verdict();
-    if verdict != Verdict::Clear {
+    if !decision.allows_running() {
         eprintln!("Guardian blocked the command because the review was not clear.");
-        return verdict.exit_code();
+        return decision.exit_code();
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &report.snapshot) {
         eprintln!("Guardian blocked the command because {error}.");
@@ -110,12 +117,12 @@ fn exec_command(command: &[OsString]) -> ExitCode {
 
 fn sandbox_command(target: &Target, command: &[OsString]) -> ExitCode {
     let report = review::review_tree(&target.config, &OpenCode::UserPath);
-    report.print(target.show_hashes);
+    let decision = report.decide(&strict);
+    report.print(target.show_hashes, decision);
 
-    let verdict = report.verdict();
-    if verdict != Verdict::Clear {
+    if !decision.allows_running() {
         eprintln!("Guardian did not run the sandbox command because the review was not clear.");
-        return verdict.exit_code();
+        return decision.exit_code();
     }
     match sandbox::run(&target.config, &report.snapshot, command) {
         Ok(code) => code,
@@ -129,8 +136,9 @@ fn sandbox_command(target: &Target, command: &[OsString]) -> ExitCode {
 fn pacman_hook_command(hook: &HookArgs) -> ExitCode {
     match pacman::review_transaction(hook) {
         Ok(report) => {
-            report.print(false);
-            report.verdict().exit_code()
+            let decision = report.decide(&strict);
+            report.print(false, decision);
+            decision.exit_code()
         }
         Err(error) => {
             eprintln!("Guardian blocked the pacman transaction: {error}");

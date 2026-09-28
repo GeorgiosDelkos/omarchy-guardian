@@ -106,14 +106,6 @@ pub enum AgentError {
     Invalid(Error),
 }
 
-impl AgentError {
-    pub fn into_error(self) -> Error {
-        match self {
-            Self::Unavailable(error) | Self::Invalid(error) => error,
-        }
-    }
-}
-
 pub fn review(
     opencode: &Path,
     files: &[SourceFile],

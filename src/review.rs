@@ -5,7 +5,7 @@ use crate::agent::{self, AgentError, SourceFile};
 use crate::config::model::AgentSettings;
 use crate::deps;
 use crate::osv;
-use crate::report::{Gap, LocalFinding, NetworkRequest, Report};
+use crate::report::{AgentOutcome, AgentRun, Gap, LocalFinding, NetworkRequest, Report};
 use crate::rules::{self, RuleId, Scheme};
 use crate::scan::{self, FileKind, ScanConfig, TextFile};
 use crate::tools::OpenCode;
@@ -132,14 +132,27 @@ pub fn run_agent(report: &mut Report, opencode: &OpenCode) {
         return;
     }
 
-    let result = opencode.resolve().and_then(|binary| {
-        agent::review(&binary, &report.agent_input, &AgentSettings::default())
-            .map_err(AgentError::into_error)
+    let settings = AgentSettings::default();
+    let outcome = match opencode.resolve() {
+        Err(error) => AgentOutcome::Unavailable(error),
+        Ok(binary) => match agent::review(&binary, &report.agent_input, &settings) {
+            Ok(review) => AgentOutcome::Reviewed(review),
+            Err(AgentError::Unavailable(error)) => AgentOutcome::Unavailable(error),
+            Err(AgentError::Invalid(error)) => {
+                report.gaps.push(Gap::Agent(error));
+                return;
+            }
+        },
+    };
+    report.agent_runs.push(AgentRun {
+        files: report
+            .agent_input
+            .iter()
+            .map(|file| file.path.clone())
+            .collect(),
+        label: settings.label(),
+        outcome,
     });
-    match result {
-        Ok(review) => report.agent = Some(review),
-        Err(error) => report.gaps.push(Gap::Agent(error)),
-    }
 }
 
 #[cfg(test)]
@@ -149,7 +162,8 @@ mod tests {
 
     use super::{analyze_text, review_tree};
     use crate::agent::Status;
-    use crate::report::{Gap, Report, Verdict};
+    use crate::config::model::{Profile, builtin};
+    use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Gap, Report};
     use crate::rules::RuleId;
     use crate::scan::ScanConfig;
     use crate::test_support::{TempDir, mock_opencode};
@@ -244,7 +258,10 @@ mod tests {
         .unwrap();
 
         let report = review_tree(&ScanConfig::new(dir.path()), &unavailable());
-        assert_eq!(report.verdict(), Verdict::Incomplete);
+        assert_eq!(
+            report.decide(&|class| builtin(Profile::Strict, class)),
+            Decision::Blocked(Blocked::Incomplete)
+        );
         assert!(
             report
                 .gaps
@@ -268,8 +285,14 @@ mod tests {
         assert!(rules.contains(&RuleId::ShellCommandExecution));
         assert!(rules.contains(&RuleId::CredentialFileAccess));
         assert!(rules.contains(&RuleId::CredentialExfiltration));
-        assert!(report.gaps.iter().any(|gap| matches!(gap, Gap::Agent(_))));
-        assert_eq!(report.verdict(), Verdict::Incomplete);
+        assert!(matches!(
+            report.agent_runs[0].outcome,
+            AgentOutcome::Unavailable(_)
+        ));
+        assert_eq!(
+            report.decide(&|class| builtin(Profile::Strict, class)),
+            Decision::Blocked(Blocked::AiUnavailable)
+        );
     }
 
     #[test]
@@ -281,11 +304,14 @@ mod tests {
         let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
         let report = review_tree(&ScanConfig::new(dir.path()), &opencode);
         assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+        assert!(matches!(
+            report.agent_runs.as_slice(),
+            [AgentRun { outcome: AgentOutcome::Reviewed(review), .. }] if review.status == Status::Clear
+        ));
         assert_eq!(
-            report.agent.as_ref().map(|review| review.status),
-            Some(Status::Clear)
+            report.decide(&|class| builtin(Profile::Strict, class)),
+            Decision::Clear
         );
-        assert_eq!(report.verdict(), Verdict::Clear);
     }
 
     #[test]
