@@ -18,7 +18,7 @@ use crate::agent::{self, AgentError, AgentReview, SourceFile};
 use crate::config::Settings;
 use crate::config::model::{AgentSettings, AiRequirement, SourceClass, Toggle};
 use crate::engine::baseline::Unit;
-use crate::engine::plan::{ManifestEntry, PlanInput, Previous, Sent};
+use crate::engine::plan::{ManifestEntry, Plan, PlanInput, Previous, Sent};
 use crate::engine::request::Request;
 use crate::engine::store::Store;
 use crate::error::Error;
@@ -117,11 +117,7 @@ pub fn review_group(
     // the store) must hold here too, not only via `Memory::open`.
     let memory = memory.filter(|_| !group.class.is_privileged());
     let mut review = GroupReview::default();
-    // A tree identical to its approved version is planned as a first review:
-    // the same request that produced the baseline, so the verdict cache can
-    // answer it (an upgrade request would differ and be a new call).
-    let previous = previous_version(memory, group.settings, &mut review.notes)
-        .filter(|previous| !is_identical(previous, group.files));
+    let previous = previous_version(memory, group.settings, &mut review.notes);
     let flagged: BTreeSet<String> = group
         .findings
         .iter()
@@ -142,7 +138,28 @@ pub fn review_group(
         max_chunks: group.settings.max_chunks,
         unit_prefixes: &unit_prefixes,
     };
-    let plan = match plan::build(&input) {
+    // A tree identical to its approved version may have been approved by a
+    // first review (a first install, or yay's second makepkg pass over it):
+    // that first-review plan is used when the cache answers every one of its
+    // chunks. Otherwise (the baseline came from an upgrade review, or the
+    // verdicts expired) the normal upgrade plan is used, never a full
+    // review that might be larger than the diff that was approved.
+    let cached_first_review = previous
+        .as_ref()
+        .filter(|previous| is_identical(previous, group.files))
+        .and_then(|_| {
+            plan::build(&PlanInput {
+                previous: None,
+                ..input
+            })
+            .ok()
+        })
+        .filter(|first| is_fully_cached(group, first, memory));
+    let built = match cached_first_review {
+        Some(first) => Ok(first),
+        None => plan::build(&input),
+    };
+    let plan = match built {
         Ok(plan) => plan,
         // Removed baseline paths alone can push the manifest over the
         // limit; a full review may still fit, so retry once without them
@@ -184,22 +201,7 @@ pub fn review_group(
         unavailable: None,
         fresh: Vec::new(),
     };
-    let count = plan.chunks.len();
-    for (index, items) in plan.chunks.into_iter().enumerate() {
-        let findings = group
-            .findings
-            .iter()
-            .filter(|finding| items.iter().any(|item| item.path() == finding.path))
-            .cloned()
-            .collect();
-        let request = Request {
-            class: group.class,
-            upgrade: plan.upgrade,
-            chunk: (index + 1, count),
-            manifest: plan.manifest.clone(),
-            findings,
-            items,
-        };
+    for request in requests(group, &plan) {
         match runner.run(&request, &mut review.notes) {
             Ok(run) => review.runs.push(run),
             Err(error) => {
@@ -210,6 +212,45 @@ pub fn review_group(
     }
     runner.save(&mut review.notes);
     review
+}
+
+/// One request per chunk of `plan`, each carrying the local findings for
+/// the files it sends.
+fn requests(group: &Group<'_>, plan: &Plan) -> Vec<Request> {
+    let count = plan.chunks.len();
+    plan.chunks
+        .iter()
+        .enumerate()
+        .map(|(index, items)| Request {
+            class: group.class,
+            upgrade: plan.upgrade,
+            chunk: (index + 1, count),
+            manifest: plan.manifest.clone(),
+            findings: group
+                .findings
+                .iter()
+                .filter(|finding| items.iter().any(|item| item.path() == finding.path))
+                .cloned()
+                .collect(),
+            items: items.clone(),
+        })
+        .collect()
+}
+
+/// Whether the verdict cache holds a verdict for every chunk of `plan`
+/// under this group's settings and class; false without a cache or chunks.
+fn is_fully_cached(group: &Group<'_>, plan: &Plan, memory: Option<&Memory>) -> bool {
+    let Some(memory) = memory.filter(|memory| memory.use_cache) else {
+        return false;
+    };
+    !plan.chunks.is_empty()
+        && requests(group, plan).iter().all(|request| {
+            let key = cache::key(group.settings, group.class, request);
+            matches!(
+                cache::lookup(&memory.store, &key, memory.now, memory.cache_max_age_secs),
+                Ok(Some(_))
+            )
+        })
 }
 
 /// The approved version to diff against, when this review uses diffs and
@@ -645,6 +686,57 @@ mod tests {
             [run] if run.cached.as_deref().is_some_and(|note| note.starts_with("from cache"))
         ));
         assert!(!bin.path().join("stdin").exists());
+    }
+
+    #[test]
+    fn an_unchanged_tree_approved_by_an_upgrade_is_reviewed_as_an_upgrade() {
+        let state = TempDir::new("engine-unchanged-upgrade");
+        let bin = TempDir::new("engine-unchanged-upgrade-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let memory = memory(&state, units("aur:demo"));
+        let settings = AgentSettings::default();
+        let library: String = (1..=40)
+            .map(|line| format!("int value_{line} = {line};\n"))
+            .collect();
+        let v1 = [
+            file("PKGBUILD", "pkgname=demo\n"),
+            file("src/lib.c", &library),
+        ];
+        assert!(remember(&memory, Some((&v1, &settings))).is_empty());
+
+        // Pass 1 of v2: an upgrade (src/lib.c as a diff), approved.
+        let v2 = [
+            file("PKGBUILD", "pkgname=demo\n"),
+            file("src/lib.c", &library.replace("value_9 = 9", "value_9 = 10")),
+        ];
+        let first = review_group(&group(&settings, &v2), &opencode, Some(&memory));
+        assert!(matches!(first.runs.as_slice(), [run] if run.cached.is_none()));
+        assert!(
+            fs::read_to_string(bin.path().join("stdin"))
+                .unwrap()
+                .contains(r#""kind":"diff""#)
+        );
+        assert!(remember(&memory, Some((&v2, &settings))).is_empty());
+        fs::remove_file(bin.path().join("stdin")).unwrap();
+
+        // Pass 2 over the identical v2 tree: no first review of v2 is
+        // cached, so it stays an upgrade and only the entry point is sent.
+        let second = review_group(&group(&settings, &v2), &opencode, Some(&memory));
+
+        assert!(
+            second
+                .notes
+                .iter()
+                .any(|note| note.contains("0 file(s) sent as diffs, 1 unchanged, 0 removed")),
+            "{:?}",
+            second.notes
+        );
+        let sent = fs::read_to_string(bin.path().join("stdin")).unwrap();
+        assert!(sent.contains("This is an upgrade"));
+        assert!(sent.contains(r#""path":"src/lib.c","bytes":"#));
+        assert!(sent.contains(r#""sent":"unchanged""#));
+        assert!(sent.contains(r#""path":"PKGBUILD","kind":"whole""#));
+        assert!(!sent.contains(r#""path":"src/lib.c","kind""#));
     }
 
     #[test]
