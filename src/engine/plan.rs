@@ -67,7 +67,6 @@ pub enum Sent {
 }
 
 impl Sent {
-    #[expect(dead_code, reason = "Public API used by callers")]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Whole => "whole",
@@ -568,5 +567,13 @@ mod tests {
 
         assert!(plan.manifest.iter().all(|entry| entry.sent == Sent::Whole));
         assert_eq!(paths(&plan.chunks[0]), ["PKGBUILD", "src/a.c"]);
+    }
+
+    #[test]
+    fn sent_variant_names_are_correct() {
+        assert_eq!(
+            [Sent::Whole, Sent::Diff, Sent::Unchanged, Sent::Removed].map(Sent::name),
+            ["whole", "diff", "unchanged", "removed"]
+        );
     }
 }
