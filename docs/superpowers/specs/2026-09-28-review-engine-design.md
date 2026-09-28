@@ -308,8 +308,9 @@ review in the same run.
 | A chunk unavailable | Later chunks are not attempted and are reported unavailable too; the class's AI-unavailable policy applies; valid verdicts from earlier chunks are cached |
 | Plan over `max_chunks`, or overhead over half the input limit | `Gap::AgentInputTooLarge`, no calls |
 
-Notes (store problems, the upgrade summary) are printed as `Review memory:`
-lines. They are not gaps: they never make a review incomplete, because the
+Notes (store problems, the upgrade summary, and on an upgrade with nothing
+to send "every file is unchanged since the approved version; no AI call was
+needed") are printed as `Review memory:` lines. They are not gaps: they never make a review incomplete, because the
 review itself still ran in full.
 
 ## 12. Testing

@@ -168,6 +168,12 @@ pub fn review_group(
     };
     if plan.upgrade {
         review.notes.push(upgrade_note(&plan.manifest));
+        if plan.chunks.is_empty() {
+            review.notes.push(
+                "every file is unchanged since the approved version; no AI call was needed"
+                    .to_string(),
+            );
+        }
     }
 
     let mut runner = Runner {
@@ -638,6 +644,38 @@ mod tests {
             second.runs.as_slice(),
             [run] if run.cached.as_deref().is_some_and(|note| note.starts_with("from cache"))
         ));
+        assert!(!bin.path().join("stdin").exists());
+    }
+
+    #[test]
+    fn an_upgrade_with_nothing_to_send_says_so() {
+        let state = TempDir::new("engine-nothing-to-send");
+        let bin = TempDir::new("engine-nothing-to-send-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let memory = memory(&state, units("aur:demo"));
+        let settings = AgentSettings::default();
+        let approved = [file("src/lib.c", "int a;\n"), file("src/old.c", "int b;\n")];
+        assert!(remember(&memory, Some((&approved, &settings))).is_empty());
+
+        // Only a non-entry file is left, unchanged; the other was removed.
+        let current = [file("src/lib.c", "int a;\n")];
+        let review = review_group(&group(&settings, &current), &opencode, Some(&memory));
+
+        assert!(review.runs.is_empty() && !review.too_large && review.invalid.is_none());
+        assert!(
+            review
+                .notes
+                .iter()
+                .any(|note| note.contains("0 file(s) sent as diffs, 1 unchanged, 1 removed")),
+            "{:?}",
+            review.notes
+        );
+        assert!(
+            review.notes.iter().any(|note| note
+                == "every file is unchanged since the approved version; no AI call was needed"),
+            "{:?}",
+            review.notes
+        );
         assert!(!bin.path().join("stdin").exists());
     }
 
