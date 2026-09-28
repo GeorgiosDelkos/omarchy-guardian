@@ -37,7 +37,8 @@ command, so its own blocks can be told apart from the command's failures.
 ## Profiles and settings
 
 Every review is tagged with the class of its source. Classes reviewed by the
-pacman hook are *privileged*: only the system file can loosen them.
+pacman hook are *privileged*: Guardian's own settings for them can only be
+loosened by the system file (but see the OpenCode caveat below).
 
 | Class | Source | Enforced by | Privileged |
 |---|---|---|---|
@@ -51,7 +52,11 @@ pacman hook are *privileged*: only the system file can loosen them.
 
 `official_repos` defaults to `core, extra, multilib, core-testing,
 extra-testing, multilib-testing, omarchy` and is settable only in the system
-file.
+file. A repo counts as `official` only if it is listed **and** its SigLevel
+requires signatures; otherwise its packages are `third-party-repo`. That
+includes Omarchy's own `[omarchy]` repo when its `pacman.conf` entry uses
+`SigLevel = Optional` or `TrustAll`; check with
+`pacman-conf --repo=omarchy SigLevel`.
 
 A profile is a named preset for every knob (`ai`, `on_findings`,
 `on_ai_suspicious`, `thinking`, `confirm`) of every class:
@@ -74,8 +79,9 @@ Settings come from two files of the same format:
 
 For the privileged classes, a user-file value for a knob applies only when it
 is at least as strict as the value from the profile and system file, and
-`model`, `[agent]`, `[agent.variants]` and `official_repos` are never taken
-from the user file at all for those classes. For the user-level classes, the
+`thinking`, `model`, `timeout_secs`, `[agent]`, `[agent.variants]` and
+`official_repos` are never taken from the user file or a user profile at all
+for those classes. For the user-level classes, the
 user file's values apply directly, since those commands never reach the
 privileged pacman gate.
 
@@ -88,7 +94,8 @@ official_repos = ["core", "extra", "multilib", "omarchy"]   # system file only
 model = "anthropic/claude-sonnet-5"   # omit for OpenCode's default
 max_input_kib = 256                   # 16..=1024
 
-[agent.variants]                      # optional: portable level -> provider variant
+[agent.variants]                      # portable level -> provider variant
+high = "high"
 max = "xhigh"
 
 [class.official]
@@ -101,6 +108,20 @@ on_findings = "block"
 ai = "required"
 timeout_secs = 300
 ```
+
+A thinking level is only sent to OpenCode (as `--variant`) when
+`[agent.variants]` maps it, because variant names differ between providers.
+An unmapped level uses the provider's default and is shown as, for example,
+`high (provider default)` in `config show` and in reports. `setup` writes the
+mapping for the level its test run passed with, in both files.
+
+The pacman hook runs the review as the invoking user from an empty
+environment, without a login shell, so shell rc files and exported variables
+cannot affect it. OpenCode still reads that user's own OpenCode configuration
+and credentials under `~`, so the provider endpoint and the default model
+used by the pacman gate remain under the user's control; a root-owned
+OpenCode configuration would be needed to close that, and Guardian does not
+set one up yet.
 
 - `omarchy-guardian setup` — interactive wizard that detects OpenCode, lets
   you choose a profile, model(s) and thinking level, runs a two-sample test
@@ -127,14 +148,20 @@ The yay shim passes `--class aur`; the Omarchy theme handler passes
 | `WARNED` | 0 | only findings whose policy is `warn`, or the AI review was unavailable under `ai = optional` |
 | `LIMITED REVIEW` | 0 | nothing reviewable (a scriptlet-free pacman transaction) |
 | `HIGH RISK` / `REVIEW REQUIRED` | 1 | any finding whose policy is `block` |
-| `INCOMPLETE` | 2 | any non-AI gap, or an invalid AI reply |
+| `INCOMPLETE` | 2 | any non-AI gap, or an invalid AI reply (malformed, missing nonce, tool use, `inconclusive`), in every profile |
 | `AI REVIEW UNAVAILABLE` | 2 | the AI review was unavailable under `ai = required` |
 | `NOT CONFIRMED` | 2 | `confirm = true` and the user did not approve |
 
-Upgrading users on the default `standard` profile now get a `WARNED` result
-instead of a block when the AI review is unavailable for official
-Arch/Omarchy packages; set `profile = "strict"` in the system file to restore
-the old, always-blocking behaviour.
+Upgrading users on the default `standard` profile: official Arch/Omarchy
+packages now `WARN` on local-rule findings and proceed without the AI review
+when it is unavailable, where they used to block. To restore the old
+behaviour, set in the system file:
+
+```toml
+[class.official]
+ai = "required"
+on_findings = "block"
+```
 
 ## What is checked
 
@@ -154,9 +181,10 @@ the old, always-blocking behaviour.
   fetched per advisory; ones OSV does not rate are shown as `UNRATED`. Any
   advisory blocks a gate. Unsupported lockfiles, manifests with dependencies
   but no lockfile, or an unavailable OSV API make the review incomplete.
-- **AI review:** the reviewable text (up to 256 KiB) is sent to the OpenCode
-  CLI **on stdin** (never in argv, which is size-limited and visible to other
-  users) with every OpenCode tool and permission denied. The reply must echo a
+- **AI review:** the reviewable text (up to `max_input_kib`, default 256 KiB)
+  is sent to the OpenCode CLI **on stdin** (never in argv, which is
+  size-limited and visible to other users) with every OpenCode tool and
+  permission denied. The reply must echo a
   random per-run nonce that only exists in that input, so a reply that never
   saw the source is rejected. Files that look sensitive by path (`.env*`, SSH
   and cloud credentials, key files, names containing `secret`, `credential` or
@@ -168,8 +196,10 @@ The walk never follows symbolic links, including ones swapped in while it
 runs: directories are read through verified `/proc/self/fd` handles and every
 opened file is checked against its earlier `lstat`. Symlinks, special files,
 non-UTF-8 file names, text files over 2 MiB, files over 512 MiB, unresolved
-Git LFS pointers and an AI review that fails or is inconclusive all make the
-review **incomplete**, never clear. `.git` is always skipped; `target`,
+Git LFS pointers and an invalid or inconclusive AI reply all make the review
+**incomplete**, never clear. An *unavailable* AI review (no OpenCode, a
+provider error, a timeout) follows the class's `ai` setting instead: `WARNED`
+for `official` under `standard`, blocked everywhere else. `.git` is always skipped; `target`,
 `node_modules`, `.venv`, `vendor`, `dist` and `build` are skipped unless
 `--thorough` is given.
 
@@ -215,7 +245,7 @@ directly (for example pamac) are not supported and will be blocked.
 
 ### yay makepkg gate
 
-Runs `guard --thorough --exclude src --exclude pkg` on the AUR build directory
+Runs `guard --class aur --thorough --exclude src --exclude pkg` on the AUR build directory
 before every `makepkg` invocation. The PKGBUILD, install scripts, patches and
 other AUR inputs are reviewed; makepkg's own `src/` and `pkg/` work
 directories (extracted upstream sources and build output) are not, so upstream

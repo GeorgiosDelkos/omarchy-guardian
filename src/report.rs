@@ -90,7 +90,7 @@ impl fmt::Display for Gap {
                 "{path}: withheld from the AI provider because it looks sensitive"
             ),
             Self::AgentInputTooLarge => {
-                f.write_str("source exceeds the 256 KiB AI review input limit")
+                f.write_str("source exceeds the AI review input limit (max_input_kib)")
             }
             Self::NoReviewableFiles => {
                 f.write_str("no readable text source files were available for review")
