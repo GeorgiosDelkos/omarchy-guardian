@@ -58,7 +58,7 @@ scan::walk ──> files + local findings
                  │
           execute(plan): per chunk -> cache lookup -> agent::review -> cache store
                  │
-          merge: worst verdict wins -> AgentOutcome -> Decision (unchanged)
+          one AgentRun per chunk -> Report::decide (unchanged precedence)
                  │
           on a complete AI "clear" -> baseline::record(identity, snapshot)
 ```
@@ -68,16 +68,22 @@ New modules under `src/engine/`:
 | Module | Responsibility |
 |---|---|
 | `plan.rs` | Risk ranking, diff-mode selection per file, chunk packing. Pure. |
-| `diff.rs` | Line-based Myers diff producing unified hunks. |
+| `diff.rs` | Line diff: common prefix and suffix trimmed, a bounded longest-common-subsequence table on the middle, unified hunks. |
+| `request.rs` | The request text: instructions, Omarchy checklist, context, nonce, untrusted JSON. Holds `PROMPT_VERSION`. |
 | `store.rs` | Content-addressed blobs and atomic writes under the state dir. |
-| `cache.rs` | Verdict cache keyed by prompt version, agent settings, class and chunk bytes. |
+| `cache.rs` | Verdict cache keyed by prompt version, agent settings, class and chunk request. |
 | `baseline.rs` | Approved snapshots per source identity. |
-| `mod.rs` | `execute` and `merge`: runs a plan through the cache and `agent::review`. |
+| `mod.rs` | `Memory`, `review_group` (runs a plan through the cache and `agent::review`) and `remember` (baseline and pruning). |
 
 `review.rs` keeps the scan, local rules and dependency audit; its
 `run_agents` becomes a call into `engine`. `agent.rs` keeps the OpenCode
-invocation and reply parsing; `build_request` gains the trusted header and
-the local-findings block (section 5).
+invocation and reply parsing; it takes the rendered request from
+`engine::request`.
+
+Each chunk becomes its own `AgentRun` covering the files it carried, so the
+existing decision precedence (incomplete, AI unavailable, findings, warned)
+combines chunk results. No separate merge step exists, and a suspicious chunk
+can never be hidden behind another chunk's outcome.
 
 ## 4. Risk ranking and chunks
 
@@ -98,16 +104,22 @@ Within a tier, files sort by path so plans are deterministic.
 
 ### Packing
 
-- Items pack whole, in tier order, into chunks whose request is at most
-  `max_input_bytes`. Packing is first-fit in order; a later small item never
-  jumps ahead of an earlier tier.
+- Size is measured as the input limit is today: path plus content bytes
+  (diff text for a diff). Every request also carries the manifest and the
+  local findings, so their size (path plus 32 bytes per manifest entry; path,
+  excerpt plus 48 bytes per finding) is taken off `max_input_bytes` first. If
+  that overhead is more than half of `max_input_bytes`, the review is
+  incomplete.
+- Items pack whole, in tier order, into chunks of the remaining capacity.
+  Packing is next-fit in order; a later small item never jumps ahead of an
+  earlier tier.
 - An item larger than one chunk splits on line boundaries; each piece is
-  labelled `path (lines a–b of n)`.
-- If tier 0 alone needs more than `max_chunks` chunks, the review is
-  incomplete (`Gap::AgentInputTooLarge`) and no AI call is made.
-- If all tiers need more than `max_chunks` chunks, the review is incomplete
-  (`Gap::AgentInputTooLarge`) and no AI call is made. A partial AI review is
-  never presented as a review of the whole source.
+  labelled `lines a-b of n`. A single line longer than a chunk (minified
+  code) is cut at character boundaries.
+- If the plan needs more than `max_chunks` chunks (which includes tier 0
+  alone needing more), the review is incomplete (`Gap::AgentInputTooLarge`)
+  and no AI call is made. A partial AI review is never presented as a review
+  of the whole source.
 - Every chunk carries the full manifest (every path, size, and whether it is
   sent whole, as a diff, or unchanged) so the AI knows what exists.
 
@@ -120,7 +132,7 @@ identity, and a valid baseline exists for it.
 |---|---|
 | Tier 0 | Whole, always |
 | Tier 1–2, new or renamed | Whole |
-| Tier 1–2, changed | Unified diff, 3 lines of context |
+| Tier 1–2, changed | Unified diff, 3 lines of context, when the diff is smaller than the file and fits in one chunk; otherwise whole |
 | Tier 1–2, unchanged | Manifest entry "unchanged since approved version" only |
 | Removed since baseline | Manifest entry "removed" only |
 
@@ -129,8 +141,8 @@ regardless of diff mode.
 
 ## 5. Prompt
 
-`PROMPT_VERSION` (an integer constant in `agent.rs`) is part of every cache
-key; any prompt change bumps it.
+`PROMPT_VERSION` (an integer constant in `engine/request.rs`) is part of
+every cache key; any prompt change bumps it.
 
 The trusted part of the request, written by Guardian, adds:
 
@@ -163,9 +175,9 @@ The reply format is unchanged.
   `~/.local/state/omarchy-guardian/`. Directories 0700, files 0600.
 - Every write is a temp file opened `create_new` in the same directory, then
   `rename`.
-- If the store directory is not owned by the current user, or is group- or
-  world-writable, the store is not used for this run and the report carries
-  `Gap::StoreUnavailable` (section 9).
+- If the store directory is not owned by the current user, or is accessible
+  to group or others, the store is not used for this run and the report
+  carries a note (section 11).
 - Pacman classes never open the store. The pacman hook never passes
   `--identity`.
 
@@ -173,7 +185,7 @@ Layout:
 
 ```
 blobs/<sha256>                         file contents; re-hashed on every read
-baselines/<class>/<sha256(identity)>   manifest (below)
+baselines/<class>.<sha256(identity)>   manifest (below)
 verdicts/<cache-key>                   one cached chunk verdict
 ```
 
@@ -193,7 +205,8 @@ Verdict entry (JSON, written with the in-crate JSON writer): `key`,
 ## 7. Verdict cache
 
 - Key: SHA-256 of `PROMPT_VERSION`, model, variant, thinking level, source
-  class, and the exact chunk request with the nonce removed.
+  class, and the exact chunk request rendered with a fixed placeholder in
+  place of the nonce.
 - Stored: `clear` and `suspicious` verdicts from valid replies only. Never
   `inconclusive`, unavailable or invalid results.
 - A hit is used only if the entry's stored `key` equals the lookup key and it
@@ -205,13 +218,17 @@ Verdict entry (JSON, written with the in-crate JSON writer): `key`,
 ## 8. Baselines
 
 - Identity comes from a new `--identity <string>` flag on the review
-  commands, set by the wrappers:
-  - `guardian-makepkg`: `aur:<pkgbase>`, from `.SRCINFO`'s `pkgbase`, else
-    the build directory's name;
-  - `guardian-theme`: `theme:<normalized git remote URL>`;
-  - explicit reviews of a path: `source:<canonical path>` when `--identity`
-    is not given.
-  - Plugins (sub-project 3 of 4) will use `plugin:<git URL>`.
+  commands, or `--unit <dir> <string>` (repeatable) when each top-level
+  directory of the target is a separate source. The wrappers set them:
+  - `guardian-makepkg`: `--identity aur:<build directory name>`. yay names
+    the build directory after the package base; `.SRCINFO` is not read,
+    because it is untrusted input that could name another package.
+  - `guardian-theme install`: `--identity theme:<theme name>`, the name the
+    theme is installed under.
+  - `guardian-theme update`: `--unit <name> theme:<name>` per staged theme.
+  - Without either flag: `<class>:<canonical path of the target>`.
+  - Plugins (sub-project 3 of 4) will use `plugin:<plugin id>`.
+- Identities are 1 to 512 bytes without control characters.
 - A baseline is recorded only when every chunk got an AI `clear` (live or
   cached), the report has no gaps, and the decision is `Clear`.
 - A manifest that does not parse, or a blob whose hash does not match, means
@@ -222,7 +239,8 @@ Verdict entry (JSON, written with the in-crate JSON writer): `key`,
 At the end of each review that used the store:
 
 1. delete expired verdicts;
-2. keep only the newest baseline per identity;
+2. (one manifest file per class and identity, so a new baseline replaces the
+   old one);
 3. delete blobs no baseline references;
 4. while the store exceeds `max_store_mib`, delete the oldest baseline and
    its unreferenced blobs.
@@ -248,11 +266,17 @@ For pacman classes, `cache` and `diff` are always `off`; setting either for a
 pacman class in any file is a config error, like other system-only keys.
 `max_chunks` for pacman classes comes from the system file only.
 
-`show` prints the new knobs per class and the store size and baseline count.
+Ranges: `max_chunks` 1 to 64, `cache_days` 0 to 365 (0 turns the cache
+off), `max_store_mib` 16 to 4096. `cache_days` and `max_store_mib` only
+affect user-level classes, so the user file may set them.
+
+`config show` prints the new knobs per class and the store size and baseline
+count.
 
 ## 10. Commands
 
-- `--identity <string>` on the review commands (section 8).
+- `--identity <string>` and `--unit <dir> <string>` on `scan`, `guard` and
+  `sandbox` (section 8).
 - `omarchy-guardian forget <identity>` removes that identity's baselines.
 - `omarchy-guardian forget --all` removes every baseline and cached verdict.
 
@@ -263,24 +287,16 @@ review in the same run.
 
 | Failure | Result |
 |---|---|
-| Store unreadable, unwritable, wrong owner or mode | No cache, no baseline, full review; `Gap::StoreUnavailable(reason)` shown as a notice |
+| Store unreadable, unwritable, wrong owner or mode | No cache, no baseline, full review; a note in the report |
 | Corrupt baseline or blob hash mismatch | Baseline deleted, full review |
-| Diff input over 1 MiB for a file | That file sent whole |
+| Diff input over 1 MiB, or a trimmed middle over 4,000,000 table cells | That file sent whole |
 | Any chunk invalid | Whole review blocked (existing invalid outcome); nothing cached from this run |
-| Any chunk unavailable | Class's AI-unavailable policy; valid chunk verdicts from this run are cached |
-| Tier 0 or whole plan over `max_chunks` | `Gap::AgentInputTooLarge`, no calls |
-| A packed chunk over `max_input_bytes` | Planner bug: `debug_assert!`; incomplete in release |
+| A chunk unavailable | Later chunks are not attempted and are reported unavailable too; the class's AI-unavailable policy applies; valid verdicts from earlier chunks are cached |
+| Plan over `max_chunks`, or overhead over half the input limit | `Gap::AgentInputTooLarge`, no calls |
 
-`Gap::StoreUnavailable` is a notice: it does not make a review incomplete,
-because the review itself still ran in full.
-
-Merging chunk outcomes:
-
-1. any invalid → the existing invalid outcome;
-2. else any unavailable → the existing unavailable outcome;
-3. else any `suspicious` → suspicious, with all chunks' findings;
-4. else any `inconclusive` → inconclusive;
-5. else clear.
+Notes (store problems, the upgrade summary) are printed as `Review memory:`
+lines. They are not gaps: they never make a review incomplete, because the
+review itself still ran in full.
 
 ## 12. Testing
 
