@@ -33,6 +33,8 @@ mod sha256;
 mod test_support;
 mod tomlish;
 mod tools;
+#[cfg(test)]
+mod zero_deps;
 
 use std::process::ExitCode;
 

@@ -14,6 +14,14 @@ jobs:
       - name: Install toolchain and test tools
         run: pacman -Syu --noconfirm --needed rust git libarchive
       - uses: actions/checkout@v4
+      - name: No dependencies
+        run: |
+          count=$(cargo tree --locked -e normal,build,dev --depth 1 --prefix none | grep -c .)
+          if [ "$count" -ne 1 ]; then
+            cargo tree --locked -e normal,build,dev --depth 1
+            echo "omarchy-guardian must not depend on any crate" >&2
+            exit 1
+          fi
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
