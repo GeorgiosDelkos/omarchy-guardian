@@ -158,10 +158,12 @@ pub fn review(
         Error::OutputTooLarge { .. } => AgentError::Invalid(error),
         other => AgentError::Unavailable(other),
     })?;
-    let output = captured.into_success().map_err(AgentError::Unavailable)?;
 
-    let text = extract_text_events(&String::from_utf8_lossy(&output))?;
-    parse_review(&text, &nonce).map_err(AgentError::Invalid)
+    // The whole event stream is judged before the exit status: a model that
+    // tried a tool or answered and then failed is invalid, not absent.
+    let events = scan_events(&String::from_utf8_lossy(&captured.stdout));
+    let failure = (!captured.status.success()).then(|| captured.failure_detail());
+    verdict(events, failure, &nonce)
 }
 
 fn random_nonce() -> Result<String, Error> {
@@ -246,14 +248,30 @@ fn opencode_config() -> Json {
     ])
 }
 
-/// Concatenates the text parts of OpenCode's JSON event stream, failing on
-/// any error or tool-use event.
-pub fn extract_text_events(output: &str) -> Result<String, AgentError> {
-    let mut response = String::new();
+/// What OpenCode's JSON event stream contained, gathered in full before the
+/// exit status is considered.
+#[derive(Debug, Default)]
+struct Events {
+    text: String,
+    tool_use: bool,
+    malformed: Option<Error>,
+    error: Option<String>,
+}
+
+fn scan_events(output: &str) -> Events {
+    let mut events = Events::default();
 
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
-        let event = Json::parse(line)
-            .map_err(|error| AgentError::Invalid(Error::parse("OpenCode event stream", error)))?;
+        let event = match Json::parse(line) {
+            Ok(event) => event,
+            Err(error) => {
+                events
+                    .malformed
+                    .get_or_insert(Error::parse("OpenCode event stream", error));
+                continue;
+            }
+        };
+
         match event.get("type").and_then(Json::as_str) {
             Some("error") => {
                 let message = event
@@ -262,36 +280,61 @@ pub fn extract_text_events(output: &str) -> Result<String, AgentError> {
                     .and_then(|data| data.get("message"))
                     .and_then(Json::as_str)
                     .unwrap_or("OpenCode reported an agent error");
-                return Err(AgentError::Unavailable(Error::ToolFailed {
-                    tool: "opencode".into(),
-                    detail: message.to_string(),
-                }));
+                events.error.get_or_insert_with(|| message.to_string());
             }
-            Some("tool_use") => {
-                return Err(AgentError::Invalid(Error::Refused(
-                    "OpenCode attempted to use a tool during source review".into(),
-                )));
-            }
+            Some("tool_use") => events.tool_use = true,
             Some("text") => {
                 if let Some(text) = event
                     .get("part")
                     .and_then(|part| part.get("text"))
                     .and_then(Json::as_str)
                 {
-                    response.push_str(text);
+                    events.text.push_str(text);
                 }
             }
             Some(_) | None => {}
         }
     }
 
-    if response.is_empty() {
-        Err(AgentError::Invalid(Error::Refused(
-            "OpenCode returned no review text".into(),
-        )))
-    } else {
-        Ok(response)
+    events
+}
+
+/// Classifies a finished run. Only a run that produced neither text nor a
+/// tool attempt can be `Unavailable`; `failure` is the exit-status detail
+/// when OpenCode did not exit successfully.
+fn verdict(
+    events: Events,
+    failure: Option<String>,
+    nonce: &str,
+) -> Result<AgentReview, AgentError> {
+    if events.tool_use {
+        return Err(AgentError::Invalid(Error::Refused(
+            "OpenCode attempted to use a tool during source review".into(),
+        )));
     }
+    if let Some(error) = events.malformed {
+        return Err(AgentError::Invalid(error));
+    }
+
+    if !events.text.is_empty() {
+        if let Some(message) = events.error {
+            return Err(AgentError::Invalid(Error::ToolFailed {
+                tool: "opencode".into(),
+                detail: format!("reported an error after replying: {message}"),
+            }));
+        }
+        return parse_review(&events.text, nonce).map_err(AgentError::Invalid);
+    }
+
+    if let Some(detail) = events.error.or(failure) {
+        return Err(AgentError::Unavailable(Error::ToolFailed {
+            tool: "opencode".into(),
+            detail,
+        }));
+    }
+    Err(AgentError::Invalid(Error::Refused(
+        "OpenCode returned no review text".into(),
+    )))
 }
 
 /// Removes one Markdown code fence around the reply, which models add even
@@ -367,29 +410,41 @@ mod tests {
     use std::fs;
 
     use super::{
-        AgentError, SourceFile, Status, build_request, extract_text_events, parse_review, review,
+        AgentError, SourceFile, Status, build_request, parse_review, review, scan_events, verdict,
     };
     use crate::config::model::{AgentSettings, Thinking};
     use crate::report::Severity;
-    use crate::test_support::{TempDir, mock_opencode, mock_opencode_failing};
+    use crate::test_support::{
+        TempDir, mock_opencode, mock_opencode_failing, mock_opencode_output, mock_opencode_then,
+    };
 
     #[test]
     fn extracts_json_text_events_from_opencode() {
         let output = r#"{"type":"step_start"}
 {"type":"text","part":{"type":"text","text":"{\"status\":"}}
 {"type":"text","part":{"type":"text","text":"\"clear\"}"}}"#;
-        assert_eq!(
-            extract_text_events(output).unwrap(),
-            r#"{"status":"clear"}"#
-        );
+        let events = scan_events(output);
+        assert_eq!(events.text, r#"{"status":"clear"}"#);
+        assert!(!events.tool_use && events.malformed.is_none() && events.error.is_none());
     }
 
     #[test]
     fn rejects_tool_calls_errors_and_empty_replies() {
-        assert!(extract_text_events(r#"{"type":"tool_use","part":{}}"#).is_err());
-        assert!(extract_text_events(r#"{"type":"error","error":{"name":"AuthError"}}"#).is_err());
-        assert!(extract_text_events(r#"{"type":"step_start"}"#).is_err());
-        assert!(extract_text_events("not json").is_err());
+        let judge = |output: &str| verdict(scan_events(output), None, "n");
+
+        assert!(matches!(
+            judge(r#"{"type":"tool_use","part":{}}"#),
+            Err(AgentError::Invalid(_))
+        ));
+        assert!(matches!(
+            judge(r#"{"type":"error","error":{"name":"AuthError"}}"#),
+            Err(AgentError::Unavailable(_))
+        ));
+        assert!(matches!(
+            judge(r#"{"type":"step_start"}"#),
+            Err(AgentError::Invalid(_))
+        ));
+        assert!(matches!(judge("not json"), Err(AgentError::Invalid(_))));
     }
 
     #[test]
@@ -540,12 +595,88 @@ mod tests {
             Err(AgentError::Invalid(_))
         ));
         assert!(matches!(
-            extract_text_events(r#"{"type":"tool_use","part":{}}"#),
+            verdict(scan_events(r#"{"type":"tool_use","part":{}}"#), None, "n"),
             Err(AgentError::Invalid(_))
         ));
         assert!(matches!(
-            extract_text_events(r#"{"type":"error","error":{"data":{"message":"rate limited"}}}"#),
+            verdict(
+                scan_events(r#"{"type":"error","error":{"data":{"message":"rate limited"}}}"#),
+                None,
+                "n"
+            ),
             Err(AgentError::Unavailable(_))
         ));
+    }
+
+    fn one_file() -> [SourceFile; 1] {
+        [SourceFile {
+            path: "a.sh".into(),
+            content: "true\n".into(),
+        }]
+    }
+
+    #[test]
+    fn a_tool_attempt_before_a_failed_exit_is_invalid() {
+        let dir = TempDir::new("opencode-tool-then-exit");
+        let binary = mock_opencode_output(dir.path(), r#"{"type":"tool_use","part":{}}"#, 1);
+
+        assert!(matches!(
+            review(&binary, &one_file(), &AgentSettings::default()),
+            Err(AgentError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_reply_followed_by_an_error_is_invalid() {
+        let dir = TempDir::new("opencode-reply-then-error");
+        let binary = mock_opencode_then(
+            dir.path(),
+            "clear",
+            true,
+            r#"printf '%s\n' '{"type":"error","error":{"data":{"message":"stream aborted"}}}'
+exit 1"#,
+        );
+
+        let error = review(&binary, &one_file(), &AgentSettings::default()).unwrap_err();
+        let AgentError::Invalid(error) = error else {
+            panic!("expected invalid, got {error:?}");
+        };
+        assert!(error.to_string().contains("stream aborted"));
+    }
+
+    #[test]
+    fn an_error_event_without_output_is_unavailable() {
+        let dir = TempDir::new("opencode-error-only");
+        let binary = mock_opencode_output(
+            dir.path(),
+            r#"{"type":"error","error":{"data":{"message":"unknown variant"}}}"#,
+            1,
+        );
+
+        let error = review(&binary, &one_file(), &AgentSettings::default()).unwrap_err();
+        let AgentError::Unavailable(error) = error else {
+            panic!("expected unavailable, got {error:?}");
+        };
+        assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn no_output_and_a_failed_exit_is_unavailable() {
+        let dir = TempDir::new("opencode-silent-exit");
+        let binary = mock_opencode_output(dir.path(), "", 1);
+
+        assert!(matches!(
+            review(&binary, &one_file(), &AgentSettings::default()),
+            Err(AgentError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn a_valid_reply_survives_a_failed_exit_without_an_error_event() {
+        let dir = TempDir::new("opencode-reply-then-exit");
+        let binary = mock_opencode_then(dir.path(), "clear", true, "exit 3");
+
+        let result = review(&binary, &one_file(), &AgentSettings::default()).unwrap();
+        assert_eq!(result.status, Status::Clear);
     }
 }
