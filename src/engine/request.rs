@@ -9,7 +9,6 @@ use crate::json::Json;
 use crate::report::LocalFinding;
 
 /// Part of every cache key: bump it whenever the request text changes.
-#[expect(dead_code, reason = "wired into cache::key in a later task")]
 pub const PROMPT_VERSION: u32 = 2;
 
 const INSTRUCTIONS: &str = "Review the supplied source for concrete malicious or dangerous \
