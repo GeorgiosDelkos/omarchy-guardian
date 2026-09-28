@@ -583,6 +583,8 @@ mod tests {
         AgentRun {
             files: files.iter().map(ToString::to_string).collect(),
             label: "m · low".into(),
+            chunk: None,
+            cached: None,
             outcome: AgentOutcome::Reviewed(AgentReview {
                 status: Status::Clear,
                 summary: "ok".into(),

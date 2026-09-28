@@ -204,6 +204,8 @@ pub fn run_agents(report: &mut Report, settings: &Settings, opencode: &OpenCode)
         report.agent_runs.push(AgentRun {
             files: files.into_iter().map(|file| file.path).collect(),
             label: agent_settings.label(),
+            chunk: None,
+            cached: None,
             outcome,
         });
     }

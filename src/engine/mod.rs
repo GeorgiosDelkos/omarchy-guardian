@@ -9,3 +9,626 @@ pub mod diff;
 pub mod plan;
 pub mod request;
 pub mod store;
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::agent::{self, AgentError, AgentReview, SourceFile};
+use crate::config::Settings;
+use crate::config::model::{AgentSettings, AiRequirement, SourceClass, Toggle};
+use crate::engine::baseline::Unit;
+use crate::engine::plan::{ManifestEntry, PlanInput, Previous, Sent};
+use crate::engine::request::Request;
+use crate::engine::store::Store;
+use crate::error::Error;
+use crate::report::{AgentOutcome, AgentRun, LocalFinding};
+use crate::tools::OpenCode;
+
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Bytes charged per local finding on top of its path and excerpt.
+const FINDING_OVERHEAD: usize = 48;
+
+/// What the review of one user-level target may remember.
+pub struct Memory {
+    pub store: Store,
+    pub class: SourceClass,
+    pub units: Vec<Unit>,
+    pub use_cache: bool,
+    pub use_diff: bool,
+    pub cache_max_age_secs: u64,
+    pub max_store_bytes: u64,
+    pub now: u64,
+}
+
+impl Memory {
+    /// `Ok(None)` when this review uses no memory: no state root, a pacman
+    /// class, `ai = off`, or both cache and diff turned off. `Err` when it
+    /// should, but the store cannot be used.
+    pub fn open(
+        settings: &Settings,
+        class: SourceClass,
+        units: Vec<Unit>,
+        root: Option<PathBuf>,
+    ) -> Result<Option<Self>, String> {
+        let Some(root) = root else {
+            return Ok(None);
+        };
+        if class.is_privileged() {
+            return Ok(None);
+        }
+        let policy = settings.policy(class);
+        if policy.ai == AiRequirement::Off {
+            return Ok(None);
+        }
+        let limits = settings.store_settings();
+        let use_cache = policy.cache == Toggle::On && limits.cache_days > 0;
+        let use_diff = policy.diff == Toggle::On && !units.is_empty();
+        if !use_cache && !use_diff {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            store: Store::open(root)?,
+            class,
+            units,
+            use_cache,
+            use_diff,
+            cache_max_age_secs: u64::from(limits.cache_days) * SECONDS_PER_DAY,
+            max_store_bytes: u64::from(limits.max_store_mib) * 1024 * 1024,
+            now: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+        }))
+    }
+}
+
+/// Files that share one set of agent settings, reviewed as one plan.
+pub struct Group<'a> {
+    pub settings: &'a AgentSettings,
+    pub class: SourceClass,
+    pub files: &'a [SourceFile],
+    pub findings: &'a [LocalFinding],
+}
+
+/// What reviewing one group produced.
+#[derive(Debug, Default)]
+pub struct GroupReview {
+    /// One run per chunk, in order.
+    pub runs: Vec<AgentRun>,
+    /// An invalid reply: the review is blocked and nothing from it is cached.
+    pub invalid: Option<Error>,
+    /// The plan needed more than `max_chunks` requests; nothing was sent.
+    pub too_large: bool,
+    /// Lines for the report: the upgrade summary and memory problems.
+    pub notes: Vec<String>,
+}
+
+pub fn review_group(
+    group: &Group<'_>,
+    opencode: &OpenCode,
+    memory: Option<&Memory>,
+) -> GroupReview {
+    let mut review = GroupReview::default();
+    let previous = previous_version(memory, &mut review.notes);
+    let flagged: BTreeSet<String> = group
+        .findings
+        .iter()
+        .map(|finding| finding.path.clone())
+        .collect();
+    let findings_bytes = group
+        .findings
+        .iter()
+        .map(|finding| finding.path.len() + finding.excerpt.len() + FINDING_OVERHEAD)
+        .sum();
+    let input = PlanInput {
+        files: group.files,
+        flagged: &flagged,
+        findings_bytes,
+        previous: previous.as_ref(),
+        max_input_bytes: group.settings.max_input_bytes,
+        max_chunks: group.settings.max_chunks,
+    };
+    let Ok(plan) = plan::build(&input) else {
+        review.too_large = true;
+        return review;
+    };
+    if plan.upgrade {
+        review.notes.push(upgrade_note(&plan.manifest));
+    }
+
+    let mut runner = Runner {
+        group,
+        opencode,
+        memory,
+        binary: None,
+        unavailable: None,
+        fresh: Vec::new(),
+    };
+    let count = plan.chunks.len();
+    for (index, items) in plan.chunks.into_iter().enumerate() {
+        let findings = group
+            .findings
+            .iter()
+            .filter(|finding| items.iter().any(|item| item.path() == finding.path))
+            .cloned()
+            .collect();
+        let request = Request {
+            class: group.class,
+            upgrade: plan.upgrade,
+            chunk: (index + 1, count),
+            manifest: plan.manifest.clone(),
+            findings,
+            items,
+        };
+        match runner.run(&request, &mut review.notes) {
+            Ok(run) => review.runs.push(run),
+            Err(error) => {
+                review.invalid = Some(error);
+                return review;
+            }
+        }
+    }
+    runner.save(&mut review.notes);
+    review
+}
+
+/// The approved version to diff against, when this review uses diffs.
+fn previous_version(memory: Option<&Memory>, notes: &mut Vec<String>) -> Option<Previous> {
+    let memory = memory.filter(|memory| memory.use_diff)?;
+    match baseline::load(&memory.store, memory.class, &memory.units) {
+        Ok(previous) => previous,
+        Err(error) => {
+            notes.push(format!(
+                "approved baseline unavailable, reviewing in full: {error}"
+            ));
+            None
+        }
+    }
+}
+
+fn upgrade_note(manifest: &[ManifestEntry]) -> String {
+    let count = |sent: Sent| manifest.iter().filter(|entry| entry.sent == sent).count();
+    format!(
+        "upgrade of the approved version: {} file(s) sent as diffs, {} unchanged, {} removed; entry points and new files are reviewed whole",
+        count(Sent::Diff),
+        count(Sent::Unchanged),
+        count(Sent::Removed)
+    )
+}
+
+/// Runs a plan's requests in order and remembers what later chunks need.
+struct Runner<'a> {
+    group: &'a Group<'a>,
+    opencode: &'a OpenCode,
+    memory: Option<&'a Memory>,
+    /// Resolved on the first request the cache cannot answer.
+    binary: Option<PathBuf>,
+    /// Set once a request finds the AI unavailable; later requests are not attempted.
+    unavailable: Option<String>,
+    /// Live verdicts to cache once no chunk was invalid.
+    fresh: Vec<(String, AgentReview)>,
+}
+
+impl Runner<'_> {
+    /// One chunk's run, or the invalid reply that blocks the whole review.
+    fn run(&mut self, request: &Request, notes: &mut Vec<String>) -> Result<AgentRun, Error> {
+        let (outcome, cached) = self.outcome(request, notes)?;
+        Ok(AgentRun {
+            files: request.paths(),
+            label: self.group.settings.label(),
+            chunk: (request.chunk.1 > 1).then_some(request.chunk),
+            cached,
+            outcome,
+        })
+    }
+
+    fn outcome(
+        &mut self,
+        request: &Request,
+        notes: &mut Vec<String>,
+    ) -> Result<(AgentOutcome, Option<String>), Error> {
+        if let Some(reason) = &self.unavailable {
+            let error = Error::Refused(format!(
+                "not attempted after an earlier chunk failed: {reason}"
+            ));
+            return Ok((AgentOutcome::Unavailable(error), None));
+        }
+
+        let memory = self.memory.filter(|memory| memory.use_cache);
+        let key = memory.map(|_| cache::key(self.group.settings, self.group.class, request));
+        if let (Some(memory), Some(key)) = (memory, key.as_deref()) {
+            match cache::lookup(&memory.store, key, memory.now, memory.cache_max_age_secs) {
+                Ok(Some(hit)) => {
+                    let note = format!(
+                        "from cache: reviewed by {} {} day(s) ago",
+                        hit.model, hit.age_days
+                    );
+                    return Ok((AgentOutcome::Reviewed(hit.review), Some(note)));
+                }
+                Ok(None) => {}
+                Err(error) => notes.push(format!("verdict cache unavailable: {error}")),
+            }
+        }
+
+        let binary = match self.binary() {
+            Ok(binary) => binary,
+            Err(error) => {
+                self.unavailable = Some(error.to_string());
+                return Ok((AgentOutcome::Unavailable(error), None));
+            }
+        };
+        match agent::review(
+            &binary,
+            &|nonce: &str| request.render(nonce),
+            self.group.settings,
+        ) {
+            Ok(review) => {
+                if let Some(key) = key {
+                    self.fresh.push((key, review.clone()));
+                }
+                Ok((AgentOutcome::Reviewed(review), None))
+            }
+            Err(AgentError::Unavailable(error)) => {
+                self.unavailable = Some(error.to_string());
+                Ok((AgentOutcome::Unavailable(error), None))
+            }
+            Err(AgentError::Invalid(error)) => Err(error),
+        }
+    }
+
+    /// OpenCode's binary, resolved once.
+    fn binary(&mut self) -> Result<PathBuf, Error> {
+        if let Some(binary) = &self.binary {
+            return Ok(binary.clone());
+        }
+        let binary = self.opencode.resolve()?;
+        self.binary = Some(binary.clone());
+        Ok(binary)
+    }
+
+    /// Caches the live verdicts; only called when no chunk was invalid.
+    fn save(&self, notes: &mut Vec<String>) {
+        let Some(memory) = self.memory else {
+            return;
+        };
+        let label = self.group.settings.label();
+        for (key, review) in &self.fresh {
+            if let Err(error) = cache::save(&memory.store, key, review, &label, memory.now) {
+                notes.push(format!("could not cache a verdict: {error}"));
+                return;
+            }
+        }
+    }
+}
+
+/// After the whole review: keep `approved` as the baseline (the caller
+/// passes it only after every chunk was clear, with no gaps and a clear
+/// decision), then prune the store. Returns notes for the report.
+pub fn remember(memory: &Memory, approved: Option<&[SourceFile]>) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(files) = approved.filter(|_| memory.use_diff)
+        && let Err(error) = baseline::record(
+            &memory.store,
+            memory.class,
+            &memory.units,
+            files,
+            memory.now,
+        )
+    {
+        notes.push(format!("could not record the approved baseline: {error}"));
+    }
+    let pruned = cache::expire(&memory.store, memory.now, memory.cache_max_age_secs)
+        .and_then(|()| baseline::collect_garbage(&memory.store, memory.max_store_bytes));
+    if let Err(error) = pruned {
+        notes.push(format!("could not prune the review memory: {error}"));
+    }
+    notes
+}
+
+#[cfg(test)]
+#[expect(clippy::format_collect, reason = "test data generation")]
+#[expect(
+    clippy::type_complexity,
+    reason = "test-only tuple, not worth a dedicated type"
+)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::{Group, Memory, remember, review_group};
+    use crate::agent::SourceFile;
+    use crate::config::Settings;
+    use crate::config::file::{AgentDefaults, PartialConfig};
+    use crate::config::model::{AgentSettings, Profile, SourceClass};
+    use crate::engine::baseline::{self, Identity, Unit};
+    use crate::engine::store::{Store, VERDICTS};
+    use crate::report::AgentOutcome;
+    use crate::test_support::{TempDir, mock_opencode, mock_opencode_counting};
+    use crate::tools::OpenCode;
+
+    fn file(path: &str, content: &str) -> SourceFile {
+        SourceFile {
+            path: path.into(),
+            content: content.into(),
+        }
+    }
+
+    fn units(identity: &str) -> Vec<Unit> {
+        vec![Unit {
+            prefix: String::new(),
+            identity: Identity::parse(identity).unwrap(),
+        }]
+    }
+
+    fn memory(state: &TempDir, units: Vec<Unit>) -> Memory {
+        Memory {
+            store: Store::open(state.path().join("store")).unwrap(),
+            class: SourceClass::Aur,
+            units,
+            use_cache: true,
+            use_diff: true,
+            cache_max_age_secs: 86_400,
+            max_store_bytes: 1 << 30,
+            now: 1_000_000,
+        }
+    }
+
+    fn group<'a>(settings: &'a AgentSettings, files: &'a [SourceFile]) -> Group<'a> {
+        Group {
+            settings,
+            class: SourceClass::Aur,
+            files,
+            findings: &[],
+        }
+    }
+
+    /// Three 300-byte files that each need their own chunk: overhead is
+    /// 3 × (3 + 32) = 105, leaving 495 bytes, and each file costs 303.
+    fn three_chunks() -> (AgentSettings, Vec<SourceFile>) {
+        let settings = AgentSettings {
+            max_input_bytes: 600,
+            ..AgentSettings::default()
+        };
+        let files = ["a.c", "b.c", "c.c"]
+            .map(|path| file(path, &"x".repeat(300)))
+            .to_vec();
+        (settings, files)
+    }
+
+    #[test]
+    fn each_chunk_is_its_own_run() {
+        let bin = TempDir::new("engine-chunks-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let (settings, files) = three_chunks();
+
+        let review = review_group(&group(&settings, &files), &opencode, None);
+
+        let chunks: Vec<(Option<(usize, usize)>, Vec<String>)> = review
+            .runs
+            .iter()
+            .map(|run| (run.chunk, run.files.clone()))
+            .collect();
+        assert_eq!(
+            chunks,
+            [
+                (Some((1, 3)), vec!["a.c".to_string()]),
+                (Some((2, 3)), vec!["b.c".to_string()]),
+                (Some((3, 3)), vec!["c.c".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cache_hit_makes_no_opencode_call() {
+        let state = TempDir::new("engine-cache");
+        let bin = TempDir::new("engine-cache-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let memory = memory(&state, Vec::new());
+        let settings = AgentSettings::default();
+        let files = [file("a.c", "int main(void) { return 0; }\n")];
+
+        let first = review_group(&group(&settings, &files), &opencode, Some(&memory));
+        assert!(matches!(first.runs.as_slice(), [run] if run.cached.is_none()));
+        fs::remove_file(bin.path().join("stdin")).unwrap();
+
+        let second = review_group(&group(&settings, &files), &opencode, Some(&memory));
+        assert!(matches!(
+            second.runs.as_slice(),
+            [run] if run.cached.as_deref().is_some_and(|note| note.starts_with("from cache"))
+        ));
+        assert!(!bin.path().join("stdin").exists());
+    }
+
+    #[test]
+    fn cached_chunks_need_no_opencode() {
+        let state = TempDir::new("engine-no-opencode");
+        let bin = TempDir::new("engine-no-opencode-bin");
+        let memory = memory(&state, Vec::new());
+        let settings = AgentSettings::default();
+        let files = [file("a.c", "int x;\n")];
+
+        let live = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        review_group(&group(&settings, &files), &live, Some(&memory));
+
+        let missing = OpenCode::At(PathBuf::from("/nonexistent/opencode"));
+        let review = review_group(&group(&settings, &files), &missing, Some(&memory));
+        assert!(matches!(
+            review.runs.as_slice(),
+            [run] if matches!(run.outcome, AgentOutcome::Reviewed(_)) && run.cached.is_some()
+        ));
+    }
+
+    #[test]
+    fn an_invalid_chunk_blocks_and_caches_nothing() {
+        let state = TempDir::new("engine-invalid");
+        let bin = TempDir::new("engine-invalid-bin");
+        let opencode = OpenCode::At(mock_opencode_counting(
+            bin.path(),
+            1,
+            "printf '%s\\n' 'not json'",
+        ));
+        let memory = memory(&state, Vec::new());
+        let (settings, files) = three_chunks();
+
+        let review = review_group(&group(&settings, &files), &opencode, Some(&memory));
+
+        assert!(review.invalid.is_some());
+        assert_eq!(review.runs.len(), 1);
+        assert!(memory.store.list(VERDICTS).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unavailable_chunk_stops_later_calls_and_keeps_earlier_verdicts() {
+        let state = TempDir::new("engine-unavailable");
+        let bin = TempDir::new("engine-unavailable-bin");
+        let opencode = OpenCode::At(mock_opencode_counting(bin.path(), 1, "exit 1"));
+        let memory = memory(&state, Vec::new());
+        let (settings, files) = three_chunks();
+
+        let review = review_group(&group(&settings, &files), &opencode, Some(&memory));
+
+        assert!(review.invalid.is_none());
+        assert_eq!(review.runs.len(), 3);
+        assert!(matches!(review.runs[0].outcome, AgentOutcome::Reviewed(_)));
+        assert!(matches!(
+            review.runs[1].outcome,
+            AgentOutcome::Unavailable(_)
+        ));
+        assert!(matches!(
+            review.runs[2].outcome,
+            AgentOutcome::Unavailable(_)
+        ));
+        assert_eq!(
+            fs::read_to_string(bin.path().join("count")).unwrap().trim(),
+            "2"
+        );
+        assert_eq!(memory.store.list(VERDICTS).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_upgrade_sends_changed_files_as_diffs_and_entry_points_whole() {
+        let state = TempDir::new("engine-upgrade");
+        let bin = TempDir::new("engine-upgrade-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let memory = memory(&state, units("aur:demo"));
+        let settings = AgentSettings::default();
+        let library: String = (1..=40)
+            .map(|line| format!("int value_{line} = {line};\n"))
+            .collect();
+
+        let first = [
+            file("PKGBUILD", "pkgname=demo\n"),
+            file("src/lib.c", &library),
+        ];
+        assert_eq!(
+            review_group(&group(&settings, &first), &opencode, Some(&memory))
+                .runs
+                .len(),
+            1
+        );
+        assert!(remember(&memory, Some(&first)).is_empty());
+
+        let upgraded = [
+            file("PKGBUILD", "pkgname=demo\n"),
+            file(
+                "src/lib.c",
+                &library.replace("value_20 = 20", "value_20 = 21"),
+            ),
+        ];
+        let review = review_group(&group(&settings, &upgraded), &opencode, Some(&memory));
+
+        assert!(
+            review
+                .notes
+                .iter()
+                .any(|note| note.contains("1 file(s) sent as diffs")),
+            "{:?}",
+            review.notes
+        );
+        let sent = fs::read_to_string(bin.path().join("stdin")).unwrap();
+        assert!(sent.contains(r#""path":"src/lib.c","kind":"diff""#));
+        assert!(sent.contains(r#""path":"PKGBUILD","kind":"whole""#));
+        assert!(sent.contains("-int value_20 = 20;"));
+    }
+
+    #[test]
+    fn a_plan_over_max_chunks_makes_no_call() {
+        let bin = TempDir::new("engine-too-large-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let (mut settings, files) = three_chunks();
+        settings.max_chunks = 2;
+
+        let review = review_group(&group(&settings, &files), &opencode, None);
+
+        assert!(review.too_large && review.runs.is_empty());
+        assert!(!bin.path().join("stdin").exists());
+    }
+
+    #[test]
+    fn remember_records_a_baseline_only_when_approved() {
+        let state = TempDir::new("engine-remember");
+        let memory = memory(&state, units("aur:demo"));
+        let files = [file("PKGBUILD", "pkgname=demo\n")];
+
+        assert!(remember(&memory, None).is_empty());
+        assert!(
+            baseline::load(&memory.store, SourceClass::Aur, &memory.units)
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(remember(&memory, Some(&files)).is_empty());
+        assert!(
+            baseline::load(&memory.store, SourceClass::Aur, &memory.units)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn memory_is_for_user_level_reviews_that_want_it() {
+        let state = TempDir::new("engine-open");
+        let root = || Some(state.path().join("store"));
+        let standard = Settings::from_parts(PartialConfig::default(), PartialConfig::default());
+
+        assert!(
+            Memory::open(&standard, SourceClass::Official, units("x:y"), root())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Memory::open(&standard, SourceClass::Aur, units("aur:x"), None)
+                .unwrap()
+                .is_none()
+        );
+        let opened = Memory::open(&standard, SourceClass::Aur, units("aur:x"), root())
+            .unwrap()
+            .unwrap();
+        assert!(opened.use_cache && opened.use_diff);
+
+        let local = standard.clone().with_profile(Profile::LocalOnly);
+        assert!(
+            Memory::open(&local, SourceClass::Aur, units("aur:x"), root())
+                .unwrap()
+                .is_none()
+        );
+
+        let no_cache = Settings::from_parts(
+            PartialConfig::default(),
+            PartialConfig {
+                agent: AgentDefaults {
+                    cache_days: Some(0),
+                    ..AgentDefaults::default()
+                },
+                ..PartialConfig::default()
+            },
+        );
+        assert!(
+            Memory::open(&no_cache, SourceClass::Aur, Vec::new(), root())
+                .unwrap()
+                .is_none()
+        );
+    }
+}

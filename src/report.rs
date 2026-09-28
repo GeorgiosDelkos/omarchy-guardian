@@ -150,6 +150,18 @@ pub struct AgentRun {
     pub files: Vec<String>,
     /// `model · thinking`, from `AgentSettings::label`.
     pub label: String,
+    /// 1-based chunk index and count when the review needed several calls.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired into the report printer in a later task")
+    )]
+    pub chunk: Option<(usize, usize)>,
+    /// Set when the verdict came from the cache: `from cache: ...`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired into the report printer in a later task")
+    )]
+    pub cached: Option<String>,
     pub outcome: AgentOutcome,
 }
 
@@ -674,6 +686,8 @@ mod tests {
         AgentRun {
             files: files.iter().map(ToString::to_string).collect(),
             label: "m · high".into(),
+            chunk: None,
+            cached: None,
             outcome: AgentOutcome::Reviewed(AgentReview {
                 status,
                 summary: "summary".into(),
@@ -686,6 +700,8 @@ mod tests {
         AgentRun {
             files: files.iter().map(ToString::to_string).collect(),
             label: "m · high".into(),
+            chunk: None,
+            cached: None,
             outcome: AgentOutcome::Unavailable(Error::Refused("provider down".into())),
         }
     }
