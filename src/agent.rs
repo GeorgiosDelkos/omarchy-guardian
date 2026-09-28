@@ -72,13 +72,6 @@ impl Status {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used by review_to_json, wired into the review cache in a later task"
-        )
-    )]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Clear => "clear",
@@ -342,10 +335,6 @@ pub fn parse_review(text: &str, nonce: &str) -> Result<AgentReview, Error> {
 }
 
 /// A review in the reply's own JSON shape, without the nonce.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the review cache in a later task")
-)]
 pub fn review_to_json(review: &AgentReview) -> Json {
     let findings = review
         .findings

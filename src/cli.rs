@@ -10,6 +10,8 @@ use std::process::{Command, ExitCode};
 use crate::config::Settings;
 use crate::config::model::{AiRequirement, Named, Profile, SourceClass};
 use crate::config::show;
+use crate::engine::baseline::Unit;
+use crate::engine::store::Store;
 use crate::pacman::{self, HookArgs};
 use crate::report::{Blocked, Decision, Report};
 use crate::review::{self, ReviewContext};
@@ -40,6 +42,9 @@ struct Target {
     show_hashes: bool,
     class: SourceClass,
     profile: Option<Profile>,
+    units: Vec<Unit>,
+    /// Filled in by `run`, so parsing stays free of the environment.
+    state_root: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -103,18 +108,21 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
     }
 
     match invocation {
-        Invocation::Scan(target) => scan_command(&target, &settings),
+        Invocation::Scan(target) => scan_command(&with_state_root(target), &settings),
         Invocation::Guard(target, command) => guard_command(
-            &target,
+            &with_state_root(target),
             &command,
             &settings,
             &OpenCode::UserPath,
             &mut TtyConfirm,
             &mut exec_command,
         ),
-        Invocation::Sandbox(target, command) => {
-            sandbox_command(&target, &command, &settings, &mut TtyConfirm)
-        }
+        Invocation::Sandbox(target, command) => sandbox_command(
+            &with_state_root(target),
+            &command,
+            &settings,
+            &mut TtyConfirm,
+        ),
         Invocation::PacmanHook(hook) => pacman_hook_command(&hook, &settings),
         Invocation::Config(command) => config_command(&command, &settings),
         Invocation::Setup => match setup::run(&mut setup::TtyTerminal, &setup::RealEnvironment) {
@@ -136,6 +144,12 @@ fn settings_for(target: &Target, settings: &Settings) -> Settings {
     }
 }
 
+/// Commands review with the user's review memory.
+fn with_state_root(mut target: Target) -> Target {
+    target.state_root = Store::default_root();
+    target
+}
+
 /// Reviews a target, applies confirmation, then prints the report once with
 /// the final decision — never a stale pre-confirmation headline.
 fn review_and_decide(
@@ -150,6 +164,8 @@ fn review_and_decide(
             settings,
             class: target.class,
             opencode,
+            units: &target.units,
+            state_root: target.state_root.as_deref(),
         },
     );
     let mut decision = report.decide(&|class| settings.policy(class));
@@ -444,6 +460,8 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
         show_hashes,
         class,
         profile,
+        units: Vec::new(),
+        state_root: None,
     })
 }
 
@@ -602,6 +620,8 @@ mod tests {
             show_hashes: false,
             class: SourceClass::Source,
             profile: None,
+            units: Vec::new(),
+            state_root: None,
         }
     }
 

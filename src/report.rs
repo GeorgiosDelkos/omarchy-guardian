@@ -3,12 +3,12 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
 use crate::agent::{AgentReview, SourceFile, Status};
-use crate::config::model::{Action, AiRequirement, DEFAULT_MAX_INPUT_KIB, Policy, SourceClass};
+use crate::config::model::{Action, AiRequirement, Policy, SourceClass};
 use crate::deps::Inventory;
 use crate::error::Error;
 use crate::osv::Audit;
@@ -90,7 +90,7 @@ impl fmt::Display for Gap {
                 "{path}: withheld from the AI provider because it looks sensitive"
             ),
             Self::AgentInputTooLarge => {
-                f.write_str("source exceeds the AI review input limit (max_input_kib)")
+                f.write_str("source exceeds the AI review input limit (max_input_kib × max_chunks)")
             }
             Self::NoReviewableFiles => {
                 f.write_str("no readable text source files were available for review")
@@ -151,16 +151,8 @@ pub struct AgentRun {
     /// `model · thinking`, from `AgentSettings::label`.
     pub label: String,
     /// 1-based chunk index and count when the review needed several calls.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired into the report printer in a later task")
-    )]
     pub chunk: Option<(usize, usize)>,
     /// Set when the verdict came from the cache: `from cache: ...`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired into the report printer in a later task")
-    )]
     pub cached: Option<String>,
     pub outcome: AgentOutcome,
 }
@@ -190,11 +182,7 @@ pub struct Report {
     pub findings: Vec<LocalFinding>,
     pub network: Vec<NetworkRequest>,
     pub agent_input: Vec<SourceFile>,
-    pub agent_input_size: usize,
     pub agent_input_overflowed: bool,
-    /// The bytes budget an AI review may be given, from the target class's
-    /// agent settings.
-    pub agent_input_limit: usize,
     /// Classes whose policy has `ai = off`: their files are never queued for
     /// the AI provider, so AI-input gaps do not apply to them either. Files
     /// are matched through `class_of`, so `file_classes` must be set before
@@ -209,6 +197,8 @@ pub struct Report {
     pub agent_runs: Vec<AgentRun>,
     /// Profile name shown next to AI verdicts.
     pub profile: String,
+    /// Review-memory lines: the upgrade summary and store problems. Never gaps.
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -252,7 +242,6 @@ impl Report {
     pub fn new(subject: impl Into<String>) -> Self {
         Self {
             subject: subject.into(),
-            agent_input_limit: DEFAULT_MAX_INPUT_KIB as usize * 1024,
             ..Self::default()
         }
     }
@@ -380,6 +369,9 @@ impl Report {
         println!("Omarchy Guardian  ·  {}", self.subject);
         self.print_headline(decision, painter);
         self.print_coverage(show_hashes, painter);
+        for note in &self.notes {
+            println!("Review memory: {note}");
+        }
         self.print_inventory();
         self.print_agent_summary(painter);
         self.print_findings(decision, painter);
@@ -544,6 +536,14 @@ impl Report {
             println!("OpenCode review: not run — source exceeds the AI input limit");
         }
         for run in &self.agent_runs {
+            let mut context = String::new();
+            if let Some((index, count)) = run.chunk {
+                let _ = write!(context, " · chunk {index}/{count}");
+            }
+            if let Some(note) = &run.cached {
+                let _ = write!(context, " · {note}");
+            }
+
             match &run.outcome {
                 AgentOutcome::Reviewed(review) => {
                     let color = match review.status {
@@ -552,7 +552,7 @@ impl Report {
                         Status::Inconclusive => "33;1",
                     };
                     println!(
-                        "OpenCode: {} · {} · profile {} — {}",
+                        "OpenCode: {} · {}{context} · profile {} — {}",
                         painter.paint(review.status.label(), color),
                         run.label,
                         self.profile,
@@ -560,7 +560,7 @@ impl Report {
                     );
                 }
                 AgentOutcome::Unavailable(error) => println!(
-                    "OpenCode: {} · {} · profile {} — {error}",
+                    "OpenCode: {} · {}{context} · profile {} — {error}",
                     painter.paint("UNAVAILABLE", "33;1"),
                     run.label,
                     self.profile
