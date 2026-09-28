@@ -17,7 +17,9 @@ compile_error!("omarchy-guardian is a Linux (Arch Linux / Omarchy) application")
 compile_error!("scan.rs hard-codes O_NONBLOCK for the generic Linux ABI; check it for this target");
 
 mod agent;
+mod classify;
 mod cli;
+mod config;
 mod deps;
 mod error;
 mod json;
@@ -28,11 +30,14 @@ mod review;
 mod rules;
 mod sandbox;
 mod scan;
+mod setup;
 mod sha256;
 #[cfg(test)]
 mod test_support;
 mod tomlish;
 mod tools;
+#[cfg(test)]
+mod zero_deps;
 
 use std::process::ExitCode;
 

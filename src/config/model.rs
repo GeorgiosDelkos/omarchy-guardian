@@ -1,0 +1,353 @@
+//! The settings vocabulary (spec §3–§5): source classes, profiles, the
+//! per-class knobs and the built-in profile tables.
+//!
+//! Knob enums declare their variants loosest first, so the derived `Ord` is
+//! the strictness order the tighten-only rule relies on.
+
+pub const DEFAULT_MAX_INPUT_KIB: u32 = 256;
+
+/// An enum spelled in the config file by a fixed lowercase name.
+pub trait Named: Copy + 'static {
+    const ALL: &'static [Self];
+
+    fn name(self) -> &'static str;
+
+    fn parse(text: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|value| value.name() == text)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SourceClass {
+    Official,
+    ThirdPartyRepo,
+    LocalPackage,
+    Aur,
+    Theme,
+    Plugin,
+    #[default]
+    Source,
+}
+
+impl SourceClass {
+    /// Enforced by the root pacman hook; user settings may only tighten these.
+    pub const fn is_privileged(self) -> bool {
+        match self {
+            Self::Official | Self::ThirdPartyRepo | Self::LocalPackage => true,
+            Self::Aur | Self::Theme | Self::Plugin | Self::Source => false,
+        }
+    }
+}
+
+impl Named for SourceClass {
+    const ALL: &'static [Self] = &[
+        Self::Official,
+        Self::ThirdPartyRepo,
+        Self::LocalPackage,
+        Self::Aur,
+        Self::Theme,
+        Self::Plugin,
+        Self::Source,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Official => "official",
+            Self::ThirdPartyRepo => "third-party-repo",
+            Self::LocalPackage => "local-package",
+            Self::Aur => "aur",
+            Self::Theme => "theme",
+            Self::Plugin => "plugin",
+            Self::Source => "source",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    Standard,
+    Strict,
+    LocalOnly,
+}
+
+impl Profile {
+    /// One line for the setup wizard and `config show`.
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::Standard => {
+                "AI review for community sources; official updates never blocked by an unavailable AI"
+            }
+            Self::Strict => "AI review required everywhere; any finding blocks",
+            Self::LocalOnly => {
+                "no AI: source never leaves this machine; you confirm community installs"
+            }
+        }
+    }
+}
+
+impl Named for Profile {
+    const ALL: &'static [Self] = &[Self::Standard, Self::Strict, Self::LocalOnly];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Strict => "strict",
+            Self::LocalOnly => "local-only",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AiRequirement {
+    Off,
+    Optional,
+    Required,
+}
+
+impl Named for AiRequirement {
+    const ALL: &'static [Self] = &[Self::Off, Self::Optional, Self::Required];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Action {
+    Warn,
+    Block,
+}
+
+impl Named for Action {
+    const ALL: &'static [Self] = &[Self::Warn, Self::Block];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Warn => "warn",
+            Self::Block => "block",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Thinking {
+    Default,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl Named for Thinking {
+    const ALL: &'static [Self] = &[
+        Self::Default,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Max,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// Everything that decides how one source class is reviewed and judged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Policy {
+    pub ai: AiRequirement,
+    /// Local-rule and OSV findings.
+    pub on_findings: Action,
+    /// An AI `suspicious` verdict or any AI finding.
+    pub on_ai_suspicious: Action,
+    pub thinking: Thinking,
+    pub model: Option<String>,
+    /// `None` derives the timeout from `thinking`.
+    pub timeout_secs: Option<u32>,
+    /// With `ai = off`: ask the user before running anything.
+    pub confirm: bool,
+}
+
+impl Policy {
+    pub fn timeout_secs(&self) -> u32 {
+        self.timeout_secs.unwrap_or(match self.thinking {
+            Thinking::High => 180,
+            Thinking::Max => 300,
+            Thinking::Default | Thinking::Minimal | Thinking::Low | Thinking::Medium => 120,
+        })
+    }
+}
+
+/// How one OpenCode review is run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSettings {
+    pub model: Option<String>,
+    pub thinking: Thinking,
+    /// The `--variant` value, or `None` for the provider default.
+    pub variant: Option<String>,
+    pub timeout_secs: u32,
+    pub max_input_bytes: usize,
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            model: None,
+            thinking: Thinking::Default,
+            variant: None,
+            timeout_secs: 120,
+            max_input_bytes: DEFAULT_MAX_INPUT_KIB as usize * 1024,
+        }
+    }
+}
+
+impl AgentSettings {
+    /// `model · thinking`, shown next to every AI verdict. A level without a
+    /// variant is marked, because OpenCode never received it.
+    pub fn label(&self) -> String {
+        let model = self.model.as_deref().unwrap_or("default model");
+        match (self.thinking, &self.variant) {
+            (Thinking::Default, _) => format!("{model} · default thinking"),
+            (level, Some(_)) => format!("{model} · {}", level.name()),
+            (level, None) => format!("{model} · {} (provider default)", level.name()),
+        }
+    }
+}
+
+/// The built-in value of every knob for one profile and class (spec §5).
+pub fn builtin(profile: Profile, class: SourceClass) -> Policy {
+    use Action::{Block, Warn};
+    use AiRequirement::{Off, Optional, Required};
+
+    let official = class == SourceClass::Official;
+    let (ai, on_findings, thinking) = match (profile, official) {
+        (Profile::Standard, true) => (Optional, Warn, Thinking::Low),
+        (Profile::Standard, false) => (Required, Block, Thinking::High),
+        (Profile::Strict, true) => (Required, Block, Thinking::Medium),
+        (Profile::Strict, false) => (Required, Block, Thinking::Max),
+        (Profile::LocalOnly, true) => (Off, Warn, Thinking::Default),
+        (Profile::LocalOnly, false) => (Off, Block, Thinking::Default),
+    };
+
+    Policy {
+        ai,
+        on_findings,
+        on_ai_suspicious: Block,
+        thinking,
+        model: None,
+        timeout_secs: None,
+        // The pacman hook has no reliable terminal, so only user-level
+        // classes can ask.
+        confirm: profile == Profile::LocalOnly && !class.is_privileged(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Action, AgentSettings, AiRequirement, Named, Policy, Profile, SourceClass, Thinking,
+        builtin,
+    };
+
+    fn knobs(policy: &Policy) -> (AiRequirement, Action, Action, Thinking, bool) {
+        (
+            policy.ai,
+            policy.on_findings,
+            policy.on_ai_suspicious,
+            policy.thinking,
+            policy.confirm,
+        )
+    }
+
+    #[test]
+    fn builtin_profiles_match_the_spec() {
+        use Action::{Block, Warn};
+        use AiRequirement::{Off, Optional, Required};
+        use Thinking::{Default, High, Low, Max, Medium};
+
+        for class in SourceClass::ALL.iter().copied() {
+            let official = class == SourceClass::Official;
+            let user_level = !class.is_privileged();
+
+            let standard = knobs(&builtin(Profile::Standard, class));
+            let strict = knobs(&builtin(Profile::Strict, class));
+            let local = knobs(&builtin(Profile::LocalOnly, class));
+
+            if official {
+                assert_eq!(standard, (Optional, Warn, Block, Low, false));
+                assert_eq!(strict, (Required, Block, Block, Medium, false));
+                assert_eq!(local, (Off, Warn, Block, Default, false));
+            } else {
+                assert_eq!(standard, (Required, Block, Block, High, false), "{class:?}");
+                assert_eq!(strict, (Required, Block, Block, Max, false), "{class:?}");
+                assert_eq!(local, (Off, Block, Block, Default, user_level), "{class:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn knob_order_is_strictness() {
+        assert!(AiRequirement::Off < AiRequirement::Optional);
+        assert!(AiRequirement::Optional < AiRequirement::Required);
+        assert!(Action::Warn < Action::Block);
+        assert!(Thinking::Default < Thinking::Minimal && Thinking::High < Thinking::Max);
+    }
+
+    #[test]
+    fn names_round_trip() {
+        for class in SourceClass::ALL.iter().copied() {
+            assert_eq!(SourceClass::parse(class.name()), Some(class));
+        }
+        assert_eq!(
+            SourceClass::parse("third-party-repo"),
+            Some(SourceClass::ThirdPartyRepo)
+        );
+        assert_eq!(Profile::parse("local-only"), Some(Profile::LocalOnly));
+        assert_eq!(Thinking::parse("max"), Some(Thinking::Max));
+        assert_eq!(
+            AiRequirement::parse("optional"),
+            Some(AiRequirement::Optional)
+        );
+        assert_eq!(Action::parse("warn"), Some(Action::Warn));
+        assert_eq!(Profile::parse("Standard"), None);
+    }
+
+    #[test]
+    fn timeouts_follow_thinking_unless_set() {
+        let mut policy = builtin(Profile::Standard, SourceClass::Aur);
+        assert_eq!(policy.timeout_secs(), 180);
+        policy.thinking = Thinking::Max;
+        assert_eq!(policy.timeout_secs(), 300);
+        policy.thinking = Thinking::Low;
+        assert_eq!(policy.timeout_secs(), 120);
+        policy.timeout_secs = Some(45);
+        assert_eq!(policy.timeout_secs(), 45);
+    }
+
+    #[test]
+    fn agent_label_names_model_and_thinking() {
+        let mut settings = AgentSettings::default();
+        assert_eq!(settings.label(), "default model · default thinking");
+        settings.model = Some("anthropic/claude-sonnet-5".into());
+        settings.thinking = Thinking::High;
+        assert_eq!(
+            settings.label(),
+            "anthropic/claude-sonnet-5 · high (provider default)"
+        );
+        settings.variant = Some("high".into());
+        assert_eq!(settings.label(), "anthropic/claude-sonnet-5 · high");
+    }
+}

@@ -18,4 +18,4 @@ fi
 # own src/ and pkg/ work directories hold extracted upstream sources and build
 # output rather than AUR inputs, so they are left out of the review and the
 # snapshot; the PKGBUILD, install scripts and patches are still reviewed.
-exec "$GUARDIAN" guard --thorough --exclude src --exclude pkg "$(pwd -P)" -- "$REAL_MAKEPKG" "$@"
+exec "$GUARDIAN" guard --class aur --thorough --exclude src --exclude pkg "$(pwd -P)" -- "$REAL_MAKEPKG" "$@"

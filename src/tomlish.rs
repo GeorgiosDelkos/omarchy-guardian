@@ -22,6 +22,8 @@ pub struct Entry {
     pub key: Vec<String>,
     /// The value's source text, trimmed, with comments removed.
     pub value: String,
+    /// 1-based line of the key.
+    pub line: usize,
 }
 
 impl Entry {
@@ -49,6 +51,12 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+impl ParseError {
+    pub fn line(&self) -> usize {
+        self.line
+    }
+}
+
 pub fn entries(text: &str) -> Result<Vec<Entry>, ParseError> {
     let mut reader = Reader {
         bytes: text.as_bytes(),
@@ -75,6 +83,7 @@ pub fn entries(text: &str) -> Result<Vec<Entry>, ParseError> {
                 section += 1;
             }
             Some(_) => {
+                let line = reader.line();
                 let key = reader.key_path()?;
                 reader.expect(b'=', "expected '=' after key")?;
                 let value = reader.value()?;
@@ -85,6 +94,7 @@ pub fn entries(text: &str) -> Result<Vec<Entry>, ParseError> {
                     array_table,
                     key,
                     value,
+                    line,
                 });
             }
         }
@@ -145,6 +155,92 @@ pub fn is_empty_container(raw: &str) -> bool {
     })
 }
 
+/// A typed value in Guardian's own config file. Only the forms the config
+/// uses are supported; anything else is `None` and becomes a config error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Value {
+    String(String),
+    Integer(i64),
+    Bool(bool),
+    StringArray(Vec<String>),
+}
+
+pub fn typed_value(raw: &str) -> Option<Value> {
+    if let Some(text) = string_value(raw) {
+        return Some(Value::String(text));
+    }
+    match raw {
+        "true" => return Some(Value::Bool(true)),
+        "false" => return Some(Value::Bool(false)),
+        _ => {}
+    }
+    if raw.starts_with('[') {
+        return string_array(raw).map(Value::StringArray);
+    }
+    integer(raw).map(Value::Integer)
+}
+
+/// Decimal integers with optional sign and single underscores between digits.
+fn integer(raw: &str) -> Option<i64> {
+    let (negative, digits) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, raw.strip_prefix('+').unwrap_or(raw)),
+    };
+
+    // Check for valid format: no leading zeros, no leading/trailing/consecutive underscores
+    let has_leading_zero = digits.len() > 1 && digits.starts_with('0');
+    let well_formed = !digits.is_empty()
+        && !digits.starts_with('_')
+        && !digits.ends_with('_')
+        && !digits.contains("__")
+        && digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'_')
+        && !has_leading_zero;
+    if !well_formed {
+        return None;
+    }
+
+    let value: i64 = digits.replace('_', "").parse().ok()?;
+    if negative {
+        value.checked_neg()
+    } else {
+        Some(value)
+    }
+}
+
+/// An array whose elements are all strings. Comments were already removed
+/// by `Reader::value`.
+fn string_array(raw: &str) -> Option<Vec<String>> {
+    let inner = raw.strip_prefix('[')?.strip_suffix(']')?.as_bytes();
+    let skip_whitespace = |index: &mut usize| {
+        while inner.get(*index).is_some_and(u8::is_ascii_whitespace) {
+            *index += 1;
+        }
+    };
+
+    let mut items = Vec::new();
+    let mut index = 0;
+    loop {
+        skip_whitespace(&mut index);
+        let (text, used) = match inner.get(index) {
+            None => return Some(items),
+            Some(b'"') => decode_basic(&inner[index + 1..])?,
+            Some(b'\'') => decode_literal(&inner[index + 1..])?,
+            Some(_) => return None,
+        };
+        items.push(text);
+        index += used + 1;
+
+        skip_whitespace(&mut index);
+        match inner.get(index) {
+            None => return Some(items),
+            Some(b',') => index += 1,
+            Some(_) => return None,
+        }
+    }
+}
+
 /// Decodes a basic string body (after the opening quote). Returns the text and
 /// the bytes consumed, including the closing quote.
 fn decode_basic(bytes: &[u8]) -> Option<(String, usize)> {
@@ -201,12 +297,19 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
-    fn error(&self, message: &'static str) -> ParseError {
-        // Splitting on newlines yields one piece per line up to the error.
-        let line = self.bytes[..self.position.min(self.bytes.len())]
+    /// 1-based line of the current position.
+    fn line(&self) -> usize {
+        // Splitting on newlines yields one piece per line up to the position.
+        self.bytes[..self.position.min(self.bytes.len())]
             .split(|byte| *byte == b'\n')
-            .count();
-        ParseError { line, message }
+            .count()
+    }
+
+    fn error(&self, message: &'static str) -> ParseError {
+        ParseError {
+            line: self.line(),
+            message,
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -393,7 +496,10 @@ impl Reader<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{array_table_items, entries, is_empty_container, string_field, string_value};
+    use super::{
+        Value, array_table_items, entries, is_empty_container, string_field, string_value,
+        typed_value,
+    };
 
     #[test]
     fn reads_tables_array_tables_and_multiline_values() {
@@ -473,5 +579,49 @@ multi "line" ]
         ] {
             assert!(entries(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn typed_values_cover_the_config_forms() {
+        assert_eq!(typed_value(r#""text""#), Some(Value::String("text".into())));
+        assert_eq!(typed_value("'lit'"), Some(Value::String("lit".into())));
+        assert_eq!(typed_value("true"), Some(Value::Bool(true)));
+        assert_eq!(typed_value("false"), Some(Value::Bool(false)));
+        assert_eq!(typed_value("120"), Some(Value::Integer(120)));
+        assert_eq!(typed_value("-5"), Some(Value::Integer(-5)));
+        assert_eq!(typed_value("1_024"), Some(Value::Integer(1024)));
+        assert_eq!(
+            typed_value("[\n \"core\", 'extra',\n]"),
+            Some(Value::StringArray(vec!["core".into(), "extra".into()]))
+        );
+        assert_eq!(typed_value("[]"), Some(Value::StringArray(Vec::new())));
+    }
+
+    #[test]
+    fn typed_values_reject_everything_else() {
+        for raw in [
+            "01",
+            "1__0",
+            "_1",
+            "1_",
+            "1.5",
+            "0x10",
+            "yes",
+            "[1, 2]",
+            "[\"a\" \"b\"]",
+            "{ a = 1 }",
+        ] {
+            assert_eq!(typed_value(raw), None, "accepted {raw:?}");
+        }
+    }
+
+    #[test]
+    fn entries_and_errors_carry_line_numbers() {
+        let parsed = entries("# c\n\na = 1\n[t]\nb = [\n 1,\n]\nc = 2\n").unwrap();
+        let lines: Vec<usize> = parsed.iter().map(|entry| entry.line).collect();
+        assert_eq!(lines, [3, 5, 8]);
+
+        let error = entries("a = 1\nb = \"open\n").unwrap_err();
+        assert_eq!(error.line(), 2);
     }
 }

@@ -53,6 +53,12 @@ pub fn tool_available(path: &str) -> bool {
 /// on the deny-all permission config, and answers with `status`. With
 /// `echo_nonce` false it answers with the wrong nonce.
 pub fn mock_opencode(dir: &Path, status: &str, echo_nonce: bool) -> PathBuf {
+    mock_opencode_then(dir, status, echo_nonce, "")
+}
+
+/// [`mock_opencode`] followed by the shell lines in `after`, for events or
+/// an exit status that come after the reply.
+pub fn mock_opencode_then(dir: &Path, status: &str, echo_nonce: bool, after: &str) -> PathBuf {
     let binary = dir.join("opencode");
     let nonce = if echo_nonce {
         r#"$(sed -n 's/^Nonce: //p' "$dir/stdin")"#
@@ -71,8 +77,29 @@ nonce={nonce}
 reply="{{\"nonce\":\"$nonce\",\"status\":\"{status}\",\"summary\":\"mock\",\"findings\":[]}}"
 escaped=$(printf '%s' "$reply" | sed 's/"/\\"/g')
 printf '{{"type":"text","part":{{"type":"text","text":"%s"}}}}\n' "$escaped"
+{after}
 "#
         ),
+    );
+    binary
+}
+
+/// A fake `opencode` that fails the way a provider or model error does.
+pub fn mock_opencode_failing(dir: &Path, stderr: &str) -> PathBuf {
+    let binary = dir.join("opencode");
+    write_script(
+        &binary,
+        &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{stderr}' >&2\nexit 1\n"),
+    );
+    binary
+}
+
+/// A fake `opencode` that prints `stdout` verbatim and exits with `code`.
+pub fn mock_opencode_output(dir: &Path, stdout: &str, code: i32) -> PathBuf {
+    let binary = dir.join("opencode");
+    write_script(
+        &binary,
+        &format!("#!/bin/sh\ncat >/dev/null\ncat <<'EOF'\n{stdout}\nEOF\nexit {code}\n"),
     );
     binary
 }
