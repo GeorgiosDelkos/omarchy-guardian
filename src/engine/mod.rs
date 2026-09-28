@@ -3,6 +3,7 @@
 //! approved baselines of user-level sources
 //! (docs/superpowers/specs/2026-09-28-review-engine-design.md).
 
+pub mod baseline;
 pub mod cache;
 pub mod diff;
 pub mod plan;
