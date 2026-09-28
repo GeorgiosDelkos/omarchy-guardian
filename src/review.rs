@@ -59,7 +59,7 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
     let memory = match Memory::open(
         context.settings,
         context.class,
-        units,
+        units.clone(),
         context.state_root.map(Path::to_path_buf),
     ) {
         Ok(memory) => memory,
@@ -74,6 +74,7 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
         &mut report,
         context.settings,
         context.opencode,
+        &units,
         memory.as_ref(),
     );
     if let Some(memory) = &memory {
@@ -186,6 +187,7 @@ pub fn run_agents(
     report: &mut Report,
     settings: &Settings,
     opencode: &OpenCode,
+    units: &[Unit],
     memory: Option<&Memory>,
 ) {
     let has_oversized = report.snapshot.count(FileKind::OversizedText) > 0;
@@ -221,6 +223,7 @@ pub fn run_agents(
             class: group_class(report, &files),
             files: &files,
             findings: &findings,
+            units,
         };
         let reviewed = engine::review_group(&group, opencode, memory);
         report.notes.extend(reviewed.notes);
@@ -513,7 +516,7 @@ mod tests {
             analyze_text(&mut report, path, "post_install() { true; }\n", false);
         }
 
-        run_agents(&mut report, &settings, &opencode, None);
+        run_agents(&mut report, &settings, &opencode, &[], None);
 
         // Official uses low thinking; the other two share high thinking.
         assert_eq!(report.agent_runs.len(), 2);

@@ -90,6 +90,9 @@ pub struct Group<'a> {
     pub class: SourceClass,
     pub files: &'a [SourceFile],
     pub findings: &'a [LocalFinding],
+    /// The review's units, for ranking a unit-relative top-level path (spec
+    /// §4); independent of whether memory is enabled for this review.
+    pub units: &'a [Unit],
 }
 
 /// What reviewing one group produced.
@@ -110,6 +113,9 @@ pub fn review_group(
     opencode: &OpenCode,
     memory: Option<&Memory>,
 ) -> GroupReview {
+    // Defence in depth: the pacman invariant (privileged classes never touch
+    // the store) must hold here too, not only via `Memory::open`.
+    let memory = memory.filter(|_| !group.class.is_privileged());
     let mut review = GroupReview::default();
     let previous = previous_version(memory, &mut review.notes);
     let flagged: BTreeSet<String> = group
@@ -122,6 +128,7 @@ pub fn review_group(
         .iter()
         .map(|finding| finding.path.len() + finding.excerpt.len() + FINDING_OVERHEAD)
         .sum();
+    let unit_prefixes: Vec<String> = group.units.iter().map(|unit| unit.prefix.clone()).collect();
     let input = PlanInput {
         files: group.files,
         flagged: &flagged,
@@ -129,10 +136,31 @@ pub fn review_group(
         previous: previous.as_ref(),
         max_input_bytes: group.settings.max_input_bytes,
         max_chunks: group.settings.max_chunks,
+        unit_prefixes: &unit_prefixes,
     };
-    let Ok(plan) = plan::build(&input) else {
-        review.too_large = true;
-        return review;
+    let plan = match plan::build(&input) {
+        Ok(plan) => plan,
+        // Removed baseline paths alone can push the manifest over the
+        // limit; a full review may still fit, so retry once without them
+        // before giving up (a diff-mode review must never be less complete
+        // than a full one would be).
+        Err(_) if previous.is_some() => {
+            let Ok(plan) = plan::build(&PlanInput {
+                previous: None,
+                ..input
+            }) else {
+                review.too_large = true;
+                return review;
+            };
+            review.notes.push(
+                "the diff-mode plan needed too many chunks; reviewing in full instead".to_string(),
+            );
+            plan
+        }
+        Err(_) => {
+            review.too_large = true;
+            return review;
+        }
     };
     if plan.upgrade {
         review.notes.push(upgrade_note(&plan.manifest));
@@ -381,6 +409,7 @@ mod tests {
             class: SourceClass::Aur,
             files,
             findings: &[],
+            units: &[],
         }
     }
 
@@ -564,6 +593,71 @@ mod tests {
 
         assert!(review.too_large && review.runs.is_empty());
         assert!(!bin.path().join("stdin").exists());
+    }
+
+    #[test]
+    fn diff_mode_retries_in_full_when_removed_baseline_paths_alone_are_too_large() {
+        let state = TempDir::new("engine-diff-retry");
+        let bin = TempDir::new("engine-diff-retry-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let memory = memory(&state, units("aur:demo"));
+
+        // Five baseline files that no longer exist: their paths alone (not
+        // the tiny current file) push the manifest overhead over the limit.
+        let removed_files: Vec<SourceFile> = (0..5)
+            .map(|index| file(&format!("removed-{index}.c"), "old\n"))
+            .collect();
+        baseline::record(
+            &memory.store,
+            SourceClass::Aur,
+            &memory.units,
+            &removed_files,
+            memory.now,
+        )
+        .unwrap();
+
+        let settings = AgentSettings {
+            max_input_bytes: 400,
+            ..AgentSettings::default()
+        };
+        let files = [file("a.c", "hi\n")];
+
+        let review = review_group(&group(&settings, &files), &opencode, Some(&memory));
+
+        assert!(!review.too_large, "{:?}", review.notes);
+        assert!(matches!(
+            review.runs.as_slice(),
+            [run] if matches!(run.outcome, AgentOutcome::Reviewed(_))
+        ));
+        assert!(
+            review
+                .notes
+                .iter()
+                .any(|note| note.contains("reviewing in full")),
+            "{:?}",
+            review.notes
+        );
+    }
+
+    #[test]
+    fn review_group_ignores_memory_for_a_privileged_class() {
+        let state = TempDir::new("engine-privileged");
+        let bin = TempDir::new("engine-privileged-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let memory = memory(&state, Vec::new());
+        let settings = AgentSettings::default();
+        let files = [file("a.c", "int x;\n")];
+        let mut privileged = group(&settings, &files);
+        privileged.class = SourceClass::Official;
+
+        let first = review_group(&privileged, &opencode, Some(&memory));
+        assert!(matches!(first.runs.as_slice(), [run] if run.cached.is_none()));
+
+        // A second run still calls OpenCode: memory was never consulted for
+        // a privileged class, so nothing was cached from the first run.
+        let second = review_group(&privileged, &opencode, Some(&memory));
+        assert!(matches!(second.runs.as_slice(), [run] if run.cached.is_none()));
+        assert!(memory.store.list(VERDICTS).unwrap().is_empty());
     }
 
     #[test]

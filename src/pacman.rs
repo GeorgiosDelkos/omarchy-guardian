@@ -102,7 +102,7 @@ pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report
         }
     }
 
-    review::run_agents(&mut report, settings, &args.opencode, None);
+    review::run_agents(&mut report, settings, &args.opencode, &[], None);
     Ok(report)
 }
 

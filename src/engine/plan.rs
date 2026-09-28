@@ -105,12 +105,15 @@ pub struct PlanInput<'a> {
     pub previous: Option<&'a Previous>,
     pub max_input_bytes: usize,
     pub max_chunks: usize,
+    /// The review's unit prefixes (`Unit::prefix`), so a unit-relative path
+    /// like `good/install.sh` still ranks as top-level under `--unit`.
+    pub unit_prefixes: &'a [String],
 }
 
 /// 0: entry points that run at install, build or login time, and flagged
 /// files; 1: other code and runtime config; 2: everything else.
-pub fn tier(path: &str, content: &str, flagged: bool) -> u8 {
-    if flagged || is_entry_point(path, content) {
+pub fn tier(path: &str, content: &str, flagged: bool, unit_prefixes: &[String]) -> u8 {
+    if flagged || is_entry_point(path, content, unit_prefixes) {
         0
     } else if rules::is_executable_or_runtime_config(path) {
         1
@@ -119,10 +122,10 @@ pub fn tier(path: &str, content: &str, flagged: bool) -> u8 {
     }
 }
 
-fn is_entry_point(path: &str, content: &str) -> bool {
+fn is_entry_point(path: &str, content: &str, unit_prefixes: &[String]) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     let extension = name.rsplit_once('.').map_or("", |(_, extension)| extension);
-    let top_level = !path.contains('/');
+    let top_level = is_top_level(path, unit_prefixes);
 
     matches!(
         name.as_str(),
@@ -146,6 +149,18 @@ fn is_entry_point(path: &str, content: &str) -> bool {
                 .any(|line| line.trim_start().starts_with("exec")))
 }
 
+/// A path is top-level within its unit when it has no '/' left after
+/// stripping whichever unit prefix it falls under; a path under no known
+/// prefix (or when no units are known) is judged by its whole path, the
+/// same rule a single unprefixed unit already gives.
+fn is_top_level(path: &str, unit_prefixes: &[String]) -> bool {
+    let relative = unit_prefixes
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix.as_str()))
+        .unwrap_or(path);
+    !relative.contains('/')
+}
+
 enum Choice {
     Whole,
     Diff(String),
@@ -159,7 +174,7 @@ pub fn build(input: &PlanInput<'_>) -> Result<Plan, TooLarge> {
         .map(|file| {
             let flagged = input.flagged.contains(&file.path);
             (
-                tier(&file.path, &file.content, flagged),
+                tier(&file.path, &file.content, flagged, input.unit_prefixes),
                 rules::is_documentation(&file.path),
                 file,
             )
@@ -382,6 +397,7 @@ mod tests {
             previous,
             max_input_bytes,
             max_chunks,
+            unit_prefixes: &[],
         })
     }
 
@@ -391,16 +407,32 @@ mod tests {
 
     #[test]
     fn tiers_rank_entry_points_first() {
-        assert_eq!(tier("PKGBUILD", "", false), 0);
-        assert_eq!(tier("guardian.install", "", false), 0);
-        assert_eq!(tier("pkg/archive/.INSTALL", "", false), 0);
-        assert_eq!(tier("install.sh", "", false), 0);
-        assert_eq!(tier("tools/run.sh", "", false), 1);
-        assert_eq!(tier("hypr/autostart.conf", "exec-once = x\n", false), 0);
-        assert_eq!(tier("hypr/colors.conf", "col = 1\n", false), 1);
-        assert_eq!(tier("src/main.c", "", false), 1);
-        assert_eq!(tier("README.md", "", false), 2);
-        assert_eq!(tier("notes.txt", "", true), 0);
+        assert_eq!(tier("PKGBUILD", "", false, &[]), 0);
+        assert_eq!(tier("guardian.install", "", false, &[]), 0);
+        assert_eq!(tier("pkg/archive/.INSTALL", "", false, &[]), 0);
+        assert_eq!(tier("install.sh", "", false, &[]), 0);
+        assert_eq!(tier("tools/run.sh", "", false, &[]), 1);
+        assert_eq!(
+            tier("hypr/autostart.conf", "exec-once = x\n", false, &[]),
+            0
+        );
+        assert_eq!(tier("hypr/colors.conf", "col = 1\n", false, &[]), 1);
+        assert_eq!(tier("src/main.c", "", false, &[]), 1);
+        assert_eq!(tier("README.md", "", false, &[]), 2);
+        assert_eq!(tier("notes.txt", "", true, &[]), 0);
+    }
+
+    #[test]
+    fn a_unit_relative_top_level_script_ranks_as_an_entry_point() {
+        // Without a unit_prefixes it does not, but under `--unit good
+        // theme:good` the file `good/install.sh` is top-level within its
+        // unit and must still rank tier 0 (spec §4: top-level *.sh always
+        // sent whole).
+        assert_eq!(tier("good/install.sh", "", false, &[]), 1);
+        let prefixes = ["good/".to_string()];
+        assert_eq!(tier("good/install.sh", "", false, &prefixes), 0);
+        assert_eq!(tier("good/nested/install.sh", "", false, &prefixes), 1);
+        assert_eq!(tier("other/install.sh", "", false, &prefixes), 1);
     }
 
     #[test]
@@ -462,6 +494,7 @@ mod tests {
                 previous: None,
                 max_input_bytes: 37 + 205,
                 max_chunks: 2,
+                unit_prefixes: &[],
             }),
             Err(TooLarge)
         );
@@ -562,6 +595,7 @@ mod tests {
             previous: Some(&previous),
             max_input_bytes: 64 * 1024,
             max_chunks: 8,
+            unit_prefixes: &[],
         })
         .unwrap();
 
