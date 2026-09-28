@@ -288,28 +288,18 @@ impl Settings {
         &self.warnings
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by `config show`/`config check` in Task 11")
-    )]
     pub fn system_status(&self) -> &FileStatus {
         &self.system_status
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by `config show`/`config check` in Task 11")
-    )]
     pub fn user_status(&self) -> &FileStatus {
         &self.user_status
     }
 
-    #[expect(dead_code, reason = "used by `config show`/`config check` in Task 11")]
     pub fn system_path(&self) -> &Path {
         &self.system_path
     }
 
-    #[expect(dead_code, reason = "used by `config show`/`config check` in Task 11")]
     pub fn user_path(&self) -> Option<&Path> {
         self.user_path.as_deref()
     }

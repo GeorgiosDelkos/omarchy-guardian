@@ -9,6 +9,7 @@ use std::process::{Command, ExitCode};
 
 use crate::config::Settings;
 use crate::config::model::{AiRequirement, Named, Profile, SourceClass};
+use crate::config::show;
 use crate::pacman::{self, HookArgs};
 use crate::report::{Blocked, Decision, Report};
 use crate::review::{self, ReviewContext};
@@ -22,6 +23,7 @@ Usage:
   omarchy-guardian guard [--thorough] [--hashes] [--exclude NAME]... [--class CLASS] [--profile PROFILE] <file-or-directory> -- <command> [args...]
   omarchy-guardian sandbox [--hashes] [--profile PROFILE] <directory> -- <command> [args...]
   omarchy-guardian pacman-hook --pacman-pid PID --cwd DIR   (run by the pacman hook)
+  omarchy-guardian config show [--class CLASS] | check | path
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
 Exit codes: 0 clear or warned, 1 findings, 2 incomplete review, AI unavailable,
@@ -44,6 +46,14 @@ enum Invocation {
     Guard(Target, Vec<OsString>),
     Sandbox(Target, Vec<OsString>),
     PacmanHook(HookArgs),
+    Config(ConfigCommand),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigCommand {
+    Show(Option<SourceClass>),
+    Check,
+    Path,
 }
 
 /// Asks the person at the terminal. Anything but an explicit yes, and any
@@ -103,6 +113,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
             sandbox_command(&target, &command, &settings, &mut TtyConfirm)
         }
         Invocation::PacmanHook(hook) => pacman_hook_command(&hook, &settings),
+        Invocation::Config(command) => config_command(&command, &settings),
     }
 }
 
@@ -266,6 +277,35 @@ fn pacman_hook_command(hook: &HookArgs, settings: &Settings) -> ExitCode {
     }
 }
 
+fn config_command(command: &ConfigCommand, settings: &Settings) -> ExitCode {
+    match command {
+        ConfigCommand::Show(class) => {
+            let classes: Vec<SourceClass> = match class {
+                Some(class) => vec![*class],
+                None => SourceClass::ALL.to_vec(),
+            };
+            print!("{}", show::render_show(settings, &classes));
+            ExitCode::SUCCESS
+        }
+        ConfigCommand::Check => {
+            let (text, valid) = show::render_check(settings);
+            print!("{text}");
+            if valid {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            }
+        }
+        ConfigCommand::Path => {
+            println!("{}", settings.system_path().display());
+            if let Some(path) = settings.user_path() {
+                println!("{}", path.display());
+            }
+            ExitCode::SUCCESS
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Allowed {
     thorough: bool,
@@ -304,7 +344,24 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
             Ok(Invocation::Sandbox(target, command))
         }
         Some("pacman-hook") => parse_hook(rest).map(Invocation::PacmanHook),
+        Some("config") => parse_config(rest).map(Invocation::Config),
         _ => Err(format!("unknown command {:?}", command.to_string_lossy())),
+    }
+}
+
+fn parse_config(args: &[OsString]) -> Result<ConfigCommand, String> {
+    let words: Vec<&str> = args
+        .iter()
+        .map(|arg| arg.to_str().unwrap_or_default())
+        .collect();
+    match words.as_slice() {
+        ["show"] => Ok(ConfigCommand::Show(None)),
+        ["show", "--class", name] => SourceClass::parse(name)
+            .map(|class| ConfigCommand::Show(Some(class)))
+            .ok_or_else(|| format!("unknown class {name:?}")),
+        ["check"] => Ok(ConfigCommand::Check),
+        ["path"] => Ok(ConfigCommand::Path),
+        _ => Err("config takes show [--class CLASS], check or path".into()),
     }
 }
 
@@ -439,7 +496,9 @@ mod tests {
     use std::path::PathBuf;
     use std::process::ExitCode;
 
-    use super::{Confirm, Invocation, Target, guard_command, parse, review_and_decide};
+    use super::{
+        ConfigCommand, Confirm, Invocation, Target, guard_command, parse, review_and_decide,
+    };
     use crate::config::Settings;
     use crate::config::file::{PartialConfig, PartialPolicy};
     use crate::config::model::{AiRequirement, Profile, SourceClass};
@@ -739,5 +798,23 @@ mod tests {
 
         assert_eq!(decision, Decision::Clear);
         assert!(confirm.1.is_empty());
+    }
+
+    #[test]
+    fn parses_config_subcommands() {
+        assert_eq!(
+            parse(&args(&["config", "check"])).unwrap(),
+            Invocation::Config(ConfigCommand::Check)
+        );
+        assert_eq!(
+            parse(&args(&["config", "path"])).unwrap(),
+            Invocation::Config(ConfigCommand::Path)
+        );
+        assert_eq!(
+            parse(&args(&["config", "show", "--class", "official"])).unwrap(),
+            Invocation::Config(ConfigCommand::Show(Some(SourceClass::Official)))
+        );
+        assert!(parse(&args(&["config"])).is_err());
+        assert!(parse(&args(&["config", "edit"])).is_err());
     }
 }

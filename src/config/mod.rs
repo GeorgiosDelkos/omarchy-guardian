@@ -5,5 +5,6 @@ pub mod file;
 pub mod load;
 pub mod model;
 pub mod resolve;
+pub mod show;
 
 pub use load::Settings;
