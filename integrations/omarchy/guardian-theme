@@ -1,0 +1,271 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+GUARDIAN=/usr/local/bin/omarchy-guardian
+OMARCHY_BIN_DIR=/usr/share/omarchy/bin
+THEMES_DIR="$HOME/.config/omarchy/themes"
+MODE=${1:-}
+shift || true
+STAGE_ROOT=""
+PRESERVE_STAGE_ROOT=0
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+
+cleanup_staging() {
+    if [[ -z $STAGE_ROOT || ! -d $STAGE_ROOT ]]; then
+        return
+    fi
+    if (( PRESERVE_STAGE_ROOT )); then
+        printf 'Guardian preserved recovery data at %s\n' "$STAGE_ROOT" >&2
+    else
+        rm -rf -- "$STAGE_ROOT"
+    fi
+}
+trap cleanup_staging EXIT
+
+fail() {
+    printf 'omarchy-guardian theme: %s\n' "$*" >&2
+    exit 2
+}
+
+[[ -x $GUARDIAN ]] || fail "Guardian is not installed at $GUARDIAN"
+[[ -x $OMARCHY_BIN_DIR/omarchy-theme-set ]] || fail "Omarchy theme commands are unavailable"
+command -v git >/dev/null || fail "git is required"
+command -v flock >/dev/null || fail "flock is required"
+
+mkdir -p "$THEMES_DIR" "$HOME/.cache/omarchy-guardian"
+if [[ $MODE != --guardian-commit-install && $MODE != --guardian-commit-update ]]; then
+    exec 9>"$HOME/.cache/omarchy-guardian/theme.lock"
+    flock 9
+fi
+
+safe_git() {
+    env \
+        GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_TERMINAL_PROMPT=0 \
+        GIT_LFS_SKIP_SMUDGE=1 \
+        git "$@"
+}
+
+validate_remote() {
+    local url=$1
+    /usr/share/omarchy/bin/omarchy-git-url-check "$url"
+}
+
+theme_name_from_url() {
+    local repo_path=$1
+    if [[ $repo_path != *"://"* && $repo_path == *:* && ${repo_path%%:*} != */* ]]; then
+        repo_path=${repo_path#*:}
+    fi
+    repo_path=${repo_path%/}
+    repo_path=${repo_path##*/}
+    repo_path=${repo_path%.git}
+    repo_path=${repo_path#omarchy-}
+    repo_path=${repo_path%-theme}
+    repo_path=${repo_path,,}
+
+    if ! (LC_ALL=C; [[ $repo_path =~ ^[a-z0-9_][a-z0-9._+-]*$ ]]); then
+        return 1
+    fi
+    printf '%s' "$repo_path"
+}
+
+check_repo_complete() {
+    local repo=$1
+    if [[ -e $repo/.gitmodules ]]; then
+        fail "submodules are not supported; refusing to review an incomplete theme"
+    fi
+}
+
+clone_theme() {
+    local url=$1
+    local destination=$2
+    local branch=${3:-}
+    validate_remote "$url" || fail "Omarchy rejected the repository URL"
+
+    if [[ -n $branch ]]; then
+        safe_git clone --branch "$branch" --single-branch -- "$url" "$destination" || \
+            fail "could not stage theme repository"
+    else
+        safe_git clone -- "$url" "$destination" || fail "could not stage theme repository"
+    fi
+    check_repo_complete "$destination"
+}
+
+install_theme() {
+    local url=${1:-}
+    local name destination staged
+
+    if (( $# > 1 )); then
+        fail "usage: omarchy theme install [git-repo-url]"
+    fi
+    if [[ -z $url ]]; then
+        command -v gum >/dev/null || fail "provide a theme repository URL"
+        url=$(gum input --placeholder="Git repo URL (https or git@host:org/repo.git)" --header="") || exit 1
+    fi
+    validate_remote "$url" || fail "Omarchy rejected the repository URL"
+    name=$(theme_name_from_url "$url") || fail "repository URL does not produce a valid theme name"
+    destination="$THEMES_DIR/$name"
+    [[ ! -L $destination ]] || fail "refusing to replace a symlinked theme directory"
+
+    STAGE_ROOT=$(mktemp -d "$THEMES_DIR/.guardian-install.XXXXXX") || fail "could not create staging directory"
+    staged="$STAGE_ROOT/repo"
+
+    clone_theme "$url" "$staged"
+    if "$GUARDIAN" guard --thorough "$staged" -- /usr/bin/bash "$SCRIPT_PATH" \
+        --guardian-commit-install "$name" "$staged"; then
+        return 0
+    else
+        local status=$?
+        (( status == 3 )) && PRESERVE_STAGE_ROOT=1
+        exit "$status"
+    fi
+}
+
+update_themes() {
+    local only_name=""
+    if (( $# == 2 )) && [[ $1 == "--only" ]]; then
+        only_name=$2
+    elif (( $# != 0 )); then
+        fail "usage: omarchy theme update [--only theme-name]"
+    fi
+
+    local theme name branch upstream remote remote_url staged status
+    local found=0
+    local -a theme_names=()
+
+    STAGE_ROOT=$(mktemp -d "$THEMES_DIR/.guardian-update.XXXXXX") || fail "could not create staging directory"
+    mkdir -p "$STAGE_ROOT/staged" "$STAGE_ROOT/backups"
+
+    for theme in "$THEMES_DIR"/*; do
+        [[ -d $theme/.git && ! -L $theme && ! -L $theme/.git ]] || continue
+        name=${theme##*/}
+        [[ -z $only_name || $name == "$only_name" ]] || continue
+        found=1
+
+        status=$(safe_git -C "$theme" status --porcelain --ignored --untracked-files=all) || \
+            fail "could not inspect installed theme $name"
+        [[ -z $status ]] || fail "theme $name has local changes; commit or stash them before updating"
+
+        branch=$(safe_git -C "$theme" symbolic-ref --quiet --short HEAD) || \
+            fail "theme $name is detached; refusing an ambiguous update"
+        upstream=$(safe_git -C "$theme" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}') || \
+            fail "theme $name has no configured upstream"
+        remote=${upstream%%/*}
+        branch=${upstream#*/}
+        remote_url=$(safe_git -C "$theme" config --get "remote.$remote.url") || \
+            fail "theme $name has no usable remote URL"
+
+        staged="$STAGE_ROOT/staged/$name"
+        clone_theme "$remote_url" "$staged" "$branch"
+        theme_names+=("$name")
+    done
+
+    (( found == 1 )) || {
+        [[ -z $only_name ]] && printf '%s\n' "No Git-installed themes to update."
+        [[ -n $only_name ]] && fail "no Git-installed theme named $only_name was found"
+        return 0
+    }
+
+    if "$GUARDIAN" guard --thorough "$STAGE_ROOT/staged" -- /usr/bin/bash "$SCRIPT_PATH" \
+        --guardian-commit-update "$STAGE_ROOT" "${theme_names[@]}"; then
+        return 0
+    else
+        local status=$?
+        (( status == 3 )) && PRESERVE_STAGE_ROOT=1
+        exit "$status"
+    fi
+}
+
+commit_install() {
+    (( $# == 2 )) || fail "invalid internal theme install commit"
+    local name=$1 staged=$2 stage_root destination backup
+    theme_name_from_url "$name" >/dev/null || fail "invalid theme name in internal commit"
+    stage_root=${staged%/repo}
+    [[ $staged == "$THEMES_DIR"/.guardian-install.*/repo ]] || fail "invalid staged theme path"
+    destination="$THEMES_DIR/$name"
+    backup="$stage_root/previous"
+    [[ -d $staged/.git && ! -L $staged && ! -L $destination ]] || fail "staged theme is incomplete"
+
+    if [[ -e $destination ]]; then
+        mv -- "$destination" "$backup" || fail "could not preserve the existing theme"
+    fi
+    if ! mv -- "$staged" "$destination"; then
+        if [[ -e $backup ]] && ! mv -- "$backup" "$destination"; then
+            printf '%s\n' "Could not restore the previous theme; recovery data: $backup" >&2
+            exit 3
+        fi
+        fail "could not install the reviewed theme"
+    fi
+    if ! "$OMARCHY_BIN_DIR/omarchy-theme-set" "$name"; then
+        rm -rf -- "$destination"
+        if [[ -e $backup ]] && ! mv -- "$backup" "$destination"; then
+            printf '%s\n' "Could not restore the previous theme; recovery data: $backup" >&2
+            exit 3
+        fi
+        fail "Omarchy could not apply the reviewed theme"
+    fi
+    [[ ! -e $backup ]] || rm -rf -- "$backup"
+    printf 'Installed reviewed theme: %s\n' "$name"
+}
+
+commit_updates() {
+    (( $# >= 2 )) || fail "invalid internal theme update commit"
+    local stage_root=$1
+    shift
+    [[ $stage_root == "$THEMES_DIR"/.guardian-update.* ]] || fail "invalid staged update path"
+
+    local name destination staged backup status i committed=0 rollback_failed=0
+    local -a names=("$@") destinations=() staged_repos=() backups=()
+    for name in "${names[@]}"; do
+        theme_name_from_url "$name" >/dev/null || fail "invalid theme name in update commit"
+        destination="$THEMES_DIR/$name"
+        staged="$stage_root/staged/$name"
+        backup="$stage_root/backups/$name"
+        [[ -d $destination/.git && ! -L $destination && -d $staged/.git ]] || \
+            fail "theme $name changed after review"
+        status=$(safe_git -C "$destination" status --porcelain --ignored --untracked-files=all) || \
+            fail "could not verify installed theme $name"
+        [[ -z $status ]] || fail "theme $name changed after review"
+        destinations+=("$destination")
+        staged_repos+=("$staged")
+        backups+=("$backup")
+    done
+
+    for i in "${!destinations[@]}"; do
+        if ! mv -- "${destinations[$i]}" "${backups[$i]}"; then
+            for ((committed -= 1; committed >= 0; committed--)); do
+                rm -rf -- "${destinations[$committed]}"
+                if ! mv -- "${backups[$committed]}" "${destinations[$committed]}"; then
+                    rollback_failed=1
+                fi
+            done
+            (( rollback_failed == 0 )) || exit 3
+            fail "could not preserve theme ${destinations[$i]}"
+        fi
+        if ! mv -- "${staged_repos[$i]}" "${destinations[$i]}"; then
+            if ! mv -- "${backups[$i]}" "${destinations[$i]}"; then
+                rollback_failed=1
+            fi
+            for ((committed -= 1; committed >= 0; committed--)); do
+                rm -rf -- "${destinations[$committed]}"
+                if ! mv -- "${backups[$committed]}" "${destinations[$committed]}"; then
+                    rollback_failed=1
+                fi
+            done
+            (( rollback_failed == 0 )) || exit 3
+            fail "could not replace theme ${destinations[$i]} with its reviewed update"
+        fi
+        committed=$((i + 1))
+    done
+
+    printf 'Updated %d reviewed theme(s).\n' "${#destinations[@]}"
+}
+
+case "$MODE" in
+    install) install_theme "$@" ;;
+    update) update_themes "$@" ;;
+    --guardian-commit-install) commit_install "$@" ;;
+    --guardian-commit-update) commit_updates "$@" ;;
+    *) fail "usage: omarchy theme {install [url]|update}" ;;
+esac

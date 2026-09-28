@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = *
+
+[Action]
+Description = Review package install scripts with Omarchy Guardian
+When = PreTransaction
+Exec = /usr/local/lib/omarchy-guardian/guardian-pacman-hook
+AbortOnFail
+NeedsTargets

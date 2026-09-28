@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+GUARDIAN=/usr/local/bin/omarchy-guardian
+
+if [ ! -x "$GUARDIAN" ]; then
+    printf '%s\n' "omarchy-guardian is not installed at $GUARDIAN" >&2
+    exit 2
+fi
+
+if [ "$(id -u)" -eq 0 ]; then
+    invoking_user=${SUDO_USER:-}
+    if [ -z "$invoking_user" ] || [ "$invoking_user" = root ]; then
+        printf '%s\n' "Cannot run the Guardian package review as the invoking user." >&2
+        exit 2
+    fi
+    GUARDIAN_ORIGINAL_PWD=$(pwd -P)
+    export GUARDIAN_ORIGINAL_PWD
+    exec /usr/bin/runuser --login \
+        --whitelist-environment=SUDO_COMMAND,GUARDIAN_ORIGINAL_PWD \
+        --command 'exec /usr/local/bin/omarchy-guardian pacman-hook "$SUDO_COMMAND" "$GUARDIAN_ORIGINAL_PWD"' \
+        "$invoking_user"
+fi
+
+if [ -z "${SUDO_COMMAND:-}" ]; then
+    printf '%s\n' "Pacman hook did not receive the sudo transaction command." >&2
+    exit 2
+fi
+exec "$GUARDIAN" pacman-hook "$SUDO_COMMAND" "$(pwd -P)"

@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+GUARDIAN=/usr/local/bin/omarchy-guardian
+REAL_MAKEPKG=/usr/bin/makepkg
+
+if [ ! -x "$GUARDIAN" ]; then
+    printf '%s\n' "omarchy-guardian is not installed at $GUARDIAN" >&2
+    exit 2
+fi
+
+if [ ! -f PKGBUILD ]; then
+    printf '%s\n' "Guardian makepkg gate requires a PKGBUILD in the working directory." >&2
+    exit 2
+fi
+
+exec "$GUARDIAN" guard --thorough "$(pwd -P)" -- "$REAL_MAKEPKG" "$@"
