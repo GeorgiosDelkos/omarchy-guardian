@@ -1,33 +1,32 @@
 //! Command-line parsing and the top-level commands.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Write};
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
-use crate::config::model::{Policy, Profile, SourceClass, builtin};
+use crate::config::Settings;
+use crate::config::model::{Named, Profile, SourceClass};
 use crate::pacman::{self, HookArgs};
-use crate::review;
+use crate::report::{Blocked, Decision, Report};
+use crate::review::{self, ReviewContext};
 use crate::sandbox;
 use crate::scan::{self, ScanConfig};
 use crate::tools::OpenCode;
 
-/// Callers keep today's fail-closed behaviour until settings are wired in
-/// (Task 9).
-fn strict(class: SourceClass) -> Policy {
-    builtin(Profile::Strict, class)
-}
-
 const USAGE: &str = "\
 Usage:
-  omarchy-guardian scan [--thorough] [--hashes] [--exclude NAME]... <file-or-directory>
-  omarchy-guardian guard [--thorough] [--hashes] [--exclude NAME]... <file-or-directory> -- <command> [args...]
-  omarchy-guardian sandbox [--hashes] <directory> -- <command> [args...]
+  omarchy-guardian scan [--thorough] [--hashes] [--exclude NAME]... [--class CLASS] [--profile PROFILE] <file-or-directory>
+  omarchy-guardian guard [--thorough] [--hashes] [--exclude NAME]... [--class CLASS] [--profile PROFILE] <file-or-directory> -- <command> [args...]
+  omarchy-guardian sandbox [--hashes] [--profile PROFILE] <directory> -- <command> [args...]
   omarchy-guardian pacman-hook --pacman-pid PID --cwd DIR   (run by the pacman hook)
 
-Exit codes: 0 clear, 1 findings, 2 incomplete review or usage error.
-guard and sandbox replace these with the command's own exit code once it starts.";
+CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
+Exit codes: 0 clear or warned, 1 findings, 2 incomplete review, AI unavailable,
+not confirmed, or usage error. guard and sandbox replace these with the
+command's own exit code once it starts.";
 
 const USAGE_ERROR: u8 = 2;
 
@@ -35,6 +34,8 @@ const USAGE_ERROR: u8 = 2;
 struct Target {
     config: ScanConfig,
     show_hashes: bool,
+    class: SourceClass,
+    profile: Option<Profile>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,43 +46,131 @@ enum Invocation {
     PacmanHook(HookArgs),
 }
 
-pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
-    let args: Vec<OsString> = args.collect();
-    match parse(&args) {
-        Ok(Invocation::Scan(target)) => scan_command(&target),
-        Ok(Invocation::Guard(target, command)) => {
-            guard_command(&target, &command, &OpenCode::UserPath, &mut exec_command)
+/// Asks the person at the terminal. Anything but an explicit yes, and any
+/// failure to reach a terminal, is a no.
+pub trait Confirm {
+    fn confirm(&mut self, question: &str) -> bool;
+}
+
+pub struct TtyConfirm;
+
+impl Confirm for TtyConfirm {
+    fn confirm(&mut self, question: &str) -> bool {
+        let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+            return false;
+        };
+        if write!(tty, "{question} [y/N] ")
+            .and_then(|()| tty.flush())
+            .is_err()
+        {
+            return false;
         }
-        Ok(Invocation::Sandbox(target, command)) => sandbox_command(&target, &command),
-        Ok(Invocation::PacmanHook(hook)) => pacman_hook_command(&hook),
-        Err(message) => {
-            eprintln!("omarchy-guardian: {message}\n\n{USAGE}");
-            ExitCode::from(USAGE_ERROR)
+
+        let mut answer = String::new();
+        if BufReader::new(tty).read_line(&mut answer).is_err() {
+            return false;
         }
+        matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
     }
 }
 
-fn scan_command(target: &Target) -> ExitCode {
-    let report = review::review_tree(&target.config, &OpenCode::UserPath);
-    let decision = report.decide(&strict);
-    report.print(target.show_hashes, decision);
-    decision.exit_code()
+pub fn run(args: impl Iterator<Item = OsString>) -> ExitCode {
+    let args: Vec<OsString> = args.collect();
+    let invocation = match parse(&args) {
+        Ok(invocation) => invocation,
+        Err(message) => {
+            eprintln!("omarchy-guardian: {message}\n\n{USAGE}");
+            return ExitCode::from(USAGE_ERROR);
+        }
+    };
+
+    let settings = Settings::load();
+    for warning in settings.warnings() {
+        eprintln!("omarchy-guardian: {warning}");
+    }
+
+    match invocation {
+        Invocation::Scan(target) => scan_command(&target, &settings),
+        Invocation::Guard(target, command) => guard_command(
+            &target,
+            &command,
+            &settings,
+            &OpenCode::UserPath,
+            &mut TtyConfirm,
+            &mut exec_command,
+        ),
+        Invocation::Sandbox(target, command) => {
+            sandbox_command(&target, &command, &settings, &mut TtyConfirm)
+        }
+        Invocation::PacmanHook(hook) => pacman_hook_command(&hook, &settings),
+    }
 }
 
-/// Reviews the target and hands `command` to `launch` only after a clear
-/// review and an unchanged re-hash of the tree.
+/// A one-run profile override (`--profile`) applies on top of the loaded
+/// settings; without it the loaded settings are used unchanged.
+fn settings_for(target: &Target, settings: &Settings) -> Settings {
+    match target.profile {
+        Some(profile) => settings.clone().with_profile(profile),
+        None => settings.clone(),
+    }
+}
+
+/// Reviews a target and applies confirmation; prints the report.
+fn review_and_decide(
+    target: &Target,
+    settings: &Settings,
+    opencode: &OpenCode,
+    confirm: Option<&mut dyn Confirm>,
+) -> (Report, Decision) {
+    let report = review::review_tree(
+        &target.config,
+        &ReviewContext {
+            settings,
+            class: target.class,
+            opencode,
+        },
+    );
+    let mut decision = report.decide(&|class| settings.policy(class));
+    report.print(target.show_hashes, decision);
+
+    if let Some(confirm) = confirm
+        && decision.allows_running()
+        && settings.policy(target.class).confirm
+    {
+        let question = format!(
+            "Local checks found nothing blocking in {}. No AI review ran. Run it?",
+            report.subject
+        );
+        if !confirm.confirm(&question) {
+            decision = Decision::Blocked(Blocked::NotConfirmed);
+        }
+    }
+    (report, decision)
+}
+
+fn scan_command(target: &Target, settings: &Settings) -> ExitCode {
+    let settings = settings_for(target, settings);
+    review_and_decide(target, &settings, &OpenCode::UserPath, None)
+        .1
+        .exit_code()
+}
+
+/// Reviews the target and hands `command` to `launch` only after a clear or
+/// warned review, an approved confirmation and an unchanged re-hash of the
+/// tree.
 fn guard_command(
     target: &Target,
     command: &[OsString],
+    settings: &Settings,
     opencode: &OpenCode,
+    confirm: &mut dyn Confirm,
     launch: &mut dyn FnMut(&[OsString]) -> ExitCode,
 ) -> ExitCode {
-    let report = review::review_tree(&target.config, opencode);
-    let decision = report.decide(&strict);
-    report.print(target.show_hashes, decision);
+    let settings = settings_for(target, settings);
+    let (report, decision) = review_and_decide(target, &settings, opencode, Some(confirm));
 
     if !decision.allows_running() {
-        eprintln!("Guardian blocked the command because the review was not clear.");
+        eprintln!("Guardian blocked the command because the review did not allow it.");
         return decision.exit_code();
     }
     if let Err(error) = scan::verify_unchanged(&target.config, &report.snapshot) {
@@ -90,7 +179,12 @@ fn guard_command(
     }
 
     eprintln!(
-        "Guardian: review clear; starting {}",
+        "Guardian: review {}; starting {}",
+        if decision == Decision::Warned {
+            "passed with warnings"
+        } else {
+            "clear"
+        },
         command.first().map_or_else(String::new, |program| program
             .to_string_lossy()
             .into_owned())
@@ -115,13 +209,18 @@ fn exec_command(command: &[OsString]) -> ExitCode {
     ExitCode::from(2)
 }
 
-fn sandbox_command(target: &Target, command: &[OsString]) -> ExitCode {
-    let report = review::review_tree(&target.config, &OpenCode::UserPath);
-    let decision = report.decide(&strict);
-    report.print(target.show_hashes, decision);
+fn sandbox_command(
+    target: &Target,
+    command: &[OsString],
+    settings: &Settings,
+    confirm: &mut dyn Confirm,
+) -> ExitCode {
+    let settings = settings_for(target, settings);
+    let (report, decision) =
+        review_and_decide(target, &settings, &OpenCode::UserPath, Some(confirm));
 
     if !decision.allows_running() {
-        eprintln!("Guardian did not run the sandbox command because the review was not clear.");
+        eprintln!("Guardian did not run the sandbox command because the review did not allow it.");
         return decision.exit_code();
     }
     match sandbox::run(&target.config, &report.snapshot, command) {
@@ -133,10 +232,10 @@ fn sandbox_command(target: &Target, command: &[OsString]) -> ExitCode {
     }
 }
 
-fn pacman_hook_command(hook: &HookArgs) -> ExitCode {
-    match pacman::review_transaction(hook) {
+fn pacman_hook_command(hook: &HookArgs, settings: &Settings) -> ExitCode {
+    match pacman::review_transaction(hook, settings) {
         Ok(report) => {
-            let decision = report.decide(&strict);
+            let decision = report.decide(&|class| settings.policy(class));
             report.print(false, decision);
             decision.exit_code()
         }
@@ -151,6 +250,7 @@ fn pacman_hook_command(hook: &HookArgs) -> ExitCode {
 struct Allowed {
     thorough: bool,
     exclude: bool,
+    class: bool,
 }
 
 fn parse(args: &[OsString]) -> Result<Invocation, String> {
@@ -160,6 +260,7 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let full = Allowed {
         thorough: true,
         exclude: true,
+        class: true,
     };
 
     match command.to_str() {
@@ -175,6 +276,7 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
                 Allowed {
                     thorough: false,
                     exclude: false,
+                    class: false,
                 },
             )?;
             // The sandbox copies everything but `.git`, so everything is reviewed.
@@ -203,6 +305,8 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
     let mut include_ignored_dirs = false;
     let mut show_hashes = false;
     let mut excluded_top_level = Vec::new();
+    let mut class = SourceClass::Source;
+    let mut profile = None;
     let mut args = args.iter();
 
     while let Some(arg) = args.next() {
@@ -212,6 +316,27 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
             Some("--exclude") if allowed.exclude => {
                 let name = args.next().ok_or("--exclude needs a directory name")?;
                 excluded_top_level.push(parse_excluded_name(name)?);
+            }
+            Some("--class") if allowed.class => {
+                let name = args
+                    .next()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                let parsed = SourceClass::parse(name)
+                    .filter(|class| !class.is_privileged())
+                    .ok_or_else(|| {
+                        format!("--class takes one of: aur, theme, plugin, source (got {name:?})")
+                    })?;
+                class = parsed;
+            }
+            Some("--profile") => {
+                let name = args
+                    .next()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                profile = Some(Profile::parse(name).ok_or_else(|| {
+                    format!("--profile takes standard, strict or local-only (got {name:?})")
+                })?);
             }
             Some(option) if option.starts_with('-') => {
                 return Err(format!(
@@ -229,6 +354,8 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
     Ok(Target {
         config,
         show_hashes,
+        class,
+        profile,
     })
 }
 
@@ -287,19 +414,42 @@ fn parse_hook(args: &[OsString]) -> Result<HookArgs, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
     use std::process::ExitCode;
 
-    use super::{Invocation, Target, guard_command, parse};
+    use super::{Confirm, Invocation, Target, guard_command, parse};
+    use crate::config::Settings;
+    use crate::config::file::PartialConfig;
+    use crate::config::model::{Profile, SourceClass};
     use crate::scan::ScanConfig;
     use crate::test_support::{TempDir, mock_opencode};
     use crate::tools::OpenCode;
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    fn unavailable() -> OpenCode {
+        OpenCode::At(PathBuf::from("/nonexistent/opencode"))
+    }
+
+    fn default_settings() -> Settings {
+        Settings::from_parts(PartialConfig::default(), PartialConfig::default())
+    }
+
+    fn local_only() -> Settings {
+        default_settings().with_profile(Profile::LocalOnly)
+    }
+
+    struct Scripted(Option<bool>, Vec<String>);
+
+    impl Confirm for Scripted {
+        fn confirm(&mut self, question: &str) -> bool {
+            self.1.push(question.to_string());
+            self.0.unwrap_or(false)
+        }
     }
 
     #[test]
@@ -359,6 +509,8 @@ mod tests {
         Target {
             config: ScanConfig::new(dir.path()),
             show_hashes: false,
+            class: SourceClass::Source,
+            profile: None,
         }
     }
 
@@ -373,14 +525,22 @@ mod tests {
         .unwrap();
         let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
 
-        let launched = Cell::new(false);
-        let status = guard_command(&target(&dir), &args(&["true"]), &opencode, &mut |_| {
-            launched.set(true);
-            ExitCode::SUCCESS
-        });
+        let mut launched = false;
+        let mut confirm = Scripted(Some(false), Vec::new());
+        let status = guard_command(
+            &target(&dir),
+            &args(&["true"]),
+            &default_settings(),
+            &opencode,
+            &mut confirm,
+            &mut |_| {
+                launched = true;
+                ExitCode::SUCCESS
+            },
+        );
 
         assert_eq!(status, ExitCode::from(1));
-        assert!(!launched.get());
+        assert!(!launched);
     }
 
     #[test]
@@ -391,10 +551,13 @@ mod tests {
         let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
 
         let mut launched = Vec::new();
+        let mut confirm = Scripted(Some(false), Vec::new());
         let status = guard_command(
             &target(&dir),
             &args(&["true", "x"]),
+            &default_settings(),
             &opencode,
+            &mut confirm,
             &mut |command| {
                 launched = command.to_vec();
                 ExitCode::from(7)
@@ -409,11 +572,88 @@ mod tests {
     fn guard_blocks_when_the_agent_is_unavailable() {
         let dir = TempDir::new("guard-no-agent");
         fs::write(dir.path().join("theme.conf"), "name = \"good\"\n").unwrap();
-        let opencode = OpenCode::At(PathBuf::from("/nonexistent/opencode"));
 
-        let status = guard_command(&target(&dir), &args(&["true"]), &opencode, &mut |_| {
-            panic!("launched without a review")
-        });
+        let mut confirm = Scripted(Some(false), Vec::new());
+        let status = guard_command(
+            &target(&dir),
+            &args(&["true"]),
+            &default_settings(),
+            &unavailable(),
+            &mut confirm,
+            &mut |_| panic!("launched without a review"),
+        );
         assert_eq!(status, ExitCode::from(2));
+    }
+
+    #[test]
+    fn local_only_asks_before_running() {
+        let dir = TempDir::new("confirm-yes");
+        fs::write(dir.path().join("theme.conf"), "name = \"good\"\n").unwrap();
+        let target = Target {
+            class: SourceClass::Theme,
+            ..target(&dir)
+        };
+
+        let mut yes = Scripted(Some(true), Vec::new());
+        let mut launched = false;
+        let status = guard_command(
+            &target,
+            &args(&["true"]),
+            &local_only(),
+            &unavailable(),
+            &mut yes,
+            &mut |_| {
+                launched = true;
+                ExitCode::SUCCESS
+            },
+        );
+        assert!(launched);
+        assert_eq!(status, ExitCode::SUCCESS);
+        assert_eq!(yes.1.len(), 1);
+    }
+
+    #[test]
+    fn confirmation_without_a_terminal_blocks() {
+        let dir = TempDir::new("confirm-none");
+        fs::write(dir.path().join("theme.conf"), "name = \"good\"\n").unwrap();
+        let target = Target {
+            class: SourceClass::Theme,
+            ..target(&dir)
+        };
+
+        let mut no_terminal = Scripted(None, Vec::new());
+        let status = guard_command(
+            &target,
+            &args(&["true"]),
+            &local_only(),
+            &unavailable(),
+            &mut no_terminal,
+            &mut |_| panic!("launched without confirmation"),
+        );
+        assert_eq!(status, ExitCode::from(2));
+    }
+
+    #[test]
+    fn class_and_profile_flags_parse() {
+        let Ok(Invocation::Scan(target)) = parse(&args(&[
+            "scan",
+            "--class",
+            "aur",
+            "--profile",
+            "strict",
+            "dir",
+        ])) else {
+            panic!("expected scan");
+        };
+        assert_eq!(target.class, SourceClass::Aur);
+        assert_eq!(target.profile, Some(Profile::Strict));
+
+        for bad in [
+            &["scan", "--class", "official", "dir"][..],
+            &["scan", "--class", "nope", "dir"],
+            &["scan", "--profile", "paranoid", "dir"],
+        ] {
+            assert!(parse(&args(bad)).is_err(), "accepted {bad:?}");
+        }
     }
 }

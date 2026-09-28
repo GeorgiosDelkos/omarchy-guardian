@@ -14,6 +14,10 @@ use crate::config::resolve::{Layers, Resolved, resolve};
 
 pub const SYSTEM_PATH: &str = "/etc/omarchy-guardian/config.toml";
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used to classify pacman targets in Task 10")
+)]
 pub const DEFAULT_OFFICIAL_REPOS: [&str; 7] = [
     "core",
     "extra",
@@ -45,7 +49,6 @@ pub struct Settings {
 }
 
 /// `$XDG_CONFIG_HOME/omarchy-guardian/config.toml`, else `~/.config/...`.
-#[expect(dead_code, reason = "wired into the CLI in Task 9")]
 pub fn user_config_path() -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -61,7 +64,6 @@ pub fn user_config_path() -> Option<PathBuf> {
 
 /// The system file and its directory must be root-owned regular entries
 /// that only root can write.
-#[expect(dead_code, reason = "wired into the CLI in Task 9")]
 pub fn check_root_owned(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !metadata.file_type().is_file() {
@@ -119,7 +121,6 @@ fn read(path: &Path, secure: Option<&Verify<'_>>) -> Read {
 }
 
 impl Settings {
-    #[expect(dead_code, reason = "wired into the CLI in Task 9")]
     pub fn load() -> Self {
         Self::load_from(
             Path::new(SYSTEM_PATH),
@@ -274,6 +275,10 @@ impl Settings {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used to classify pacman targets in Task 10")
+    )]
     pub fn official_repos(&self) -> Vec<String> {
         self.system.official_repos.clone().unwrap_or_else(|| {
             DEFAULT_OFFICIAL_REPOS
@@ -291,20 +296,28 @@ impl Settings {
         &self.warnings
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by `config show`/`config check` in Task 11")
+    )]
     pub fn system_status(&self) -> &FileStatus {
         &self.system_status
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by `config show`/`config check` in Task 11")
+    )]
     pub fn user_status(&self) -> &FileStatus {
         &self.user_status
     }
 
-    #[expect(dead_code, reason = "wired into the CLI in Task 9")]
+    #[expect(dead_code, reason = "used by `config show`/`config check` in Task 11")]
     pub fn system_path(&self) -> &Path {
         &self.system_path
     }
 
-    #[expect(dead_code, reason = "wired into the CLI in Task 9")]
+    #[expect(dead_code, reason = "used by `config show`/`config check` in Task 11")]
     pub fn user_path(&self) -> Option<&Path> {
         self.user_path.as_deref()
     }

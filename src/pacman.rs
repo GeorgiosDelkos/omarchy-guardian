@@ -13,6 +13,8 @@ use std::fs;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
+use crate::config::Settings;
+use crate::config::model::{Named, SourceClass};
 use crate::error::{Error, IoContext};
 use crate::report::{Gap, Report};
 use crate::review;
@@ -42,12 +44,21 @@ pub enum Operation {
     LocalUpgrade,
 }
 
-pub fn review_transaction(args: &HookArgs) -> Result<Report, Error> {
+pub fn review_transaction(args: &HookArgs, settings: &Settings) -> Result<Report, Error> {
+    if let Some(reason) = settings.privileged_block() {
+        return Err(Error::Refused(reason.to_string()));
+    }
+
     let targets = read_targets(io::stdin().lock())?;
     let argv = pacman_argv(args.pacman_pid)?;
     let operation = parse_operation(&argv)?;
 
     let mut report = Report::new("pacman transaction");
+    // Until each target is classified, judge everything as the strictest
+    // pacman class.
+    report.class = SourceClass::ThirdPartyRepo;
+    report.profile = settings.system_profile().name().to_string();
+
     let archives = match operation {
         Operation::Sync => sync_archives(&targets)?,
         Operation::LocalUpgrade => local_archives(&argv, &args.cwd)?,
@@ -75,7 +86,7 @@ pub fn review_transaction(args: &HookArgs) -> Result<Report, Error> {
         }
     }
 
-    review::run_agent(&mut report, &args.opencode);
+    review::run_agents(&mut report, settings, &args.opencode);
     Ok(report)
 }
 
@@ -533,7 +544,7 @@ mod tests {
         let dir = TempDir::new("pacman-install");
         let archive = build_package(dir.path(), Some("post_install() { rm -rf /; }\n"));
 
-        let mut report = Report::default();
+        let mut report = Report::new("test");
         assert!(scan_install_script(&archive, "sample", &mut report).unwrap());
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].rule, RuleId::DestructiveSystemOperation);

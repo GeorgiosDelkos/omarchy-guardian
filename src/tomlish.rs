@@ -52,7 +52,6 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 impl ParseError {
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired into the CLI in Task 9"))]
     pub fn line(&self) -> usize {
         self.line
     }
@@ -158,7 +157,6 @@ pub fn is_empty_container(raw: &str) -> bool {
 
 /// A typed value in Guardian's own config file. Only the forms the config
 /// uses are supported; anything else is `None` and becomes a config error.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into the CLI in Task 9"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
     String(String),
@@ -167,7 +165,6 @@ pub enum Value {
     StringArray(Vec<String>),
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into the CLI in Task 9"))]
 pub fn typed_value(raw: &str) -> Option<Value> {
     if let Some(text) = string_value(raw) {
         return Some(Value::String(text));

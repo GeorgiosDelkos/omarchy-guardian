@@ -24,7 +24,7 @@ pub enum Origin {
 }
 
 impl Origin {
-    #[expect(dead_code, reason = "wired into the CLI in Task 9")]
+    #[expect(dead_code, reason = "used by `config show`/`config check` in Task 11")]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Profile => "profile",
@@ -50,6 +50,10 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by `config show`/`config check` in Task 11")
+    )]
     pub fn origin(&self, knob: &str) -> Origin {
         self.origins
             .iter()

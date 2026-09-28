@@ -8,7 +8,7 @@ use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
 use crate::agent::{AgentReview, SourceFile, Status};
-use crate::config::model::{Action, AiRequirement, Policy, SourceClass};
+use crate::config::model::{Action, AiRequirement, DEFAULT_MAX_INPUT_KIB, Policy, SourceClass};
 use crate::deps::Inventory;
 use crate::error::Error;
 use crate::osv::Audit;
@@ -106,7 +106,6 @@ pub enum Blocked {
     Findings,
     Incomplete,
     AiUnavailable,
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired into the CLI in Task 9"))]
     NotConfirmed,
 }
 
@@ -181,6 +180,9 @@ pub struct Report {
     pub agent_input: Vec<SourceFile>,
     pub agent_input_size: usize,
     pub agent_input_overflowed: bool,
+    /// The bytes budget an AI review may be given, from the target class's
+    /// agent settings.
+    pub agent_input_limit: usize,
     pub dependencies: Inventory,
     pub audit: Option<Audit>,
     /// Class of every file not listed in `file_classes`.
@@ -233,6 +235,7 @@ impl Report {
     pub fn new(subject: impl Into<String>) -> Self {
         Self {
             subject: subject.into(),
+            agent_input_limit: DEFAULT_MAX_INPUT_KIB as usize * 1024,
             ..Self::default()
         }
     }

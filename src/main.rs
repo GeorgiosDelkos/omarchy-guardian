@@ -18,7 +18,6 @@ compile_error!("scan.rs hard-codes O_NONBLOCK for the generic Linux ABI; check i
 
 mod agent;
 mod cli;
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into the CLI in Task 9"))]
 mod config;
 mod deps;
 mod error;

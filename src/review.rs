@@ -2,7 +2,8 @@
 //! audit, then the OpenCode review.
 
 use crate::agent::{self, AgentError, SourceFile};
-use crate::config::model::AgentSettings;
+use crate::config::Settings;
+use crate::config::model::{AgentSettings, AiRequirement, Named, SourceClass};
 use crate::deps;
 use crate::osv;
 use crate::report::{AgentOutcome, AgentRun, Gap, LocalFinding, NetworkRequest, Report};
@@ -10,13 +11,30 @@ use crate::rules::{self, RuleId, Scheme};
 use crate::scan::{self, FileKind, ScanConfig, TextFile};
 use crate::tools::OpenCode;
 
-pub const MAX_AGENT_INPUT_SIZE: usize = 256 * 1024;
 const EXCERPT_CHARS: usize = 180;
 const LFS_POINTER: &str = "version https://git-lfs.github.com/spec/v1";
 
-/// Reviews a file or directory tree.
-pub fn review_tree(config: &ScanConfig, opencode: &OpenCode) -> Report {
+/// What one review runs against: the settings, the class the target itself
+/// belongs to, and where to find OpenCode.
+pub struct ReviewContext<'a> {
+    pub settings: &'a Settings,
+    pub class: SourceClass,
+    pub opencode: &'a OpenCode,
+}
+
+/// Reviews a file or directory tree as one source class.
+pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
     let mut report = Report::new(config.root.display().to_string());
+    report.class = context.class;
+    report.profile = context
+        .settings
+        .profile_for(context.class)
+        .name()
+        .to_string();
+    report.agent_input_limit = context
+        .settings
+        .agent_settings(context.class)
+        .max_input_bytes;
 
     let (snapshot, walk_gaps) = scan::walk(config, &mut |file: TextFile<'_>| {
         analyze_text(&mut report, file.rel, file.text, true);
@@ -28,7 +46,7 @@ pub fn review_tree(config: &ScanConfig, opencode: &OpenCode) -> Report {
     }
 
     audit_dependencies(&mut report);
-    run_agent(&mut report, opencode);
+    run_agents(&mut report, context.settings, context.opencode);
     report
 }
 
@@ -68,7 +86,7 @@ fn queue_for_agent(report: &mut Report, rel: &str, text: &str) {
     }
 
     let size = rel.len() + text.len();
-    if report.agent_input_size + size > MAX_AGENT_INPUT_SIZE {
+    if report.agent_input_size + size > report.agent_input_limit {
         if !report.agent_input_overflowed {
             report.agent_input_overflowed = true;
             report.gaps.push(Gap::AgentInputTooLarge);
@@ -124,35 +142,50 @@ fn audit_dependencies(report: &mut Report) {
     }
 }
 
-/// Runs the AI review when there is complete input to give it; an oversized
-/// tree is already incomplete, so it is not sent to the provider at all.
-pub fn run_agent(report: &mut Report, opencode: &OpenCode) {
+/// Runs the AI review for every file whose class policy wants one. Files
+/// whose classes resolve to the same agent settings share one call. An
+/// oversized or truncated input is already incomplete, so nothing is sent.
+pub fn run_agents(report: &mut Report, settings: &Settings, opencode: &OpenCode) {
     let has_oversized = report.snapshot.count(FileKind::OversizedText) > 0;
     if report.agent_input.is_empty() || report.agent_input_overflowed || has_oversized {
         return;
     }
 
-    let settings = AgentSettings::default();
-    let outcome = match opencode.resolve() {
-        Err(error) => AgentOutcome::Unavailable(error),
-        Ok(binary) => match agent::review(&binary, &report.agent_input, &settings) {
-            Ok(review) => AgentOutcome::Reviewed(review),
-            Err(AgentError::Unavailable(error)) => AgentOutcome::Unavailable(error),
-            Err(AgentError::Invalid(error)) => {
-                report.gaps.push(Gap::Agent(error));
-                return;
-            }
-        },
-    };
-    report.agent_runs.push(AgentRun {
-        files: report
-            .agent_input
-            .iter()
-            .map(|file| file.path.clone())
-            .collect(),
-        label: settings.label(),
-        outcome,
-    });
+    let mut groups: Vec<(AgentSettings, Vec<SourceFile>)> = Vec::new();
+    for file in &report.agent_input {
+        let class = report.class_of(&file.path);
+        if settings.policy(class).ai == AiRequirement::Off {
+            continue;
+        }
+
+        let agent_settings = settings.agent_settings(class);
+        match groups
+            .iter_mut()
+            .find(|(existing, _)| *existing == agent_settings)
+        {
+            Some((_, files)) => files.push(file.clone()),
+            None => groups.push((agent_settings, vec![file.clone()])),
+        }
+    }
+
+    for (agent_settings, files) in groups {
+        let outcome = match opencode.resolve() {
+            Err(error) => AgentOutcome::Unavailable(error),
+            Ok(binary) => match agent::review(&binary, &files, &agent_settings) {
+                Ok(review) => AgentOutcome::Reviewed(review),
+                Err(AgentError::Unavailable(error)) => AgentOutcome::Unavailable(error),
+                Err(AgentError::Invalid(error)) => {
+                    report.gaps.push(Gap::Agent(error));
+                    continue;
+                }
+            },
+        };
+        report.agent_runs.push(AgentRun {
+            files: files.into_iter().map(|file| file.path).collect(),
+            label: agent_settings.label(),
+            outcome,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -160,9 +193,11 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{analyze_text, review_tree};
+    use super::{ReviewContext, analyze_text, review_tree, run_agents};
     use crate::agent::Status;
-    use crate::config::model::{Profile, builtin};
+    use crate::config::Settings;
+    use crate::config::file::{AgentDefaults, PartialConfig};
+    use crate::config::model::{Profile, SourceClass, builtin};
     use crate::report::{AgentOutcome, AgentRun, Blocked, Decision, Gap, Report};
     use crate::rules::RuleId;
     use crate::scan::ScanConfig;
@@ -177,9 +212,25 @@ mod tests {
         report.findings.iter().map(|finding| finding.rule).collect()
     }
 
+    fn context<'a>(
+        settings: &'a Settings,
+        class: SourceClass,
+        opencode: &'a OpenCode,
+    ) -> ReviewContext<'a> {
+        ReviewContext {
+            settings,
+            class,
+            opencode,
+        }
+    }
+
+    fn default_settings() -> Settings {
+        Settings::from_parts(PartialConfig::default(), PartialConfig::default())
+    }
+
     #[test]
     fn reports_cleartext_ip_and_credential_exfiltration() {
-        let mut report = Report::default();
+        let mut report = Report::new("test");
         analyze_text(
             &mut report,
             "src/send.py",
@@ -194,7 +245,7 @@ mod tests {
         assert!(rules.contains(&RuleId::CleartextNetworkRequest));
         assert!(rules.contains(&RuleId::DirectIpNetworkRequest));
 
-        let mut tls = Report::default();
+        let mut tls = Report::new("test");
         analyze_text(
             &mut tls,
             "client.py",
@@ -206,7 +257,7 @@ mod tests {
 
     #[test]
     fn documentation_is_reviewed_by_the_agent_but_not_the_local_rules() {
-        let mut report = Report::default();
+        let mut report = Report::new("test");
         analyze_text(
             &mut report,
             "README.md",
@@ -219,7 +270,7 @@ mod tests {
 
     #[test]
     fn sensitive_files_are_withheld_and_incomplete() {
-        let mut report = Report::default();
+        let mut report = Report::new("test");
         analyze_text(&mut report, ".env", "TOKEN=x\n", true);
         assert!(report.agent_input.is_empty());
         assert!(matches!(
@@ -230,7 +281,7 @@ mod tests {
 
     #[test]
     fn agent_input_is_bounded() {
-        let mut report = Report::default();
+        let mut report = Report::new("test");
         let chunk = "a".repeat(200 * 1024);
         analyze_text(&mut report, "one.txt", &chunk, false);
         analyze_text(&mut report, "two.txt", &chunk, false);
@@ -257,7 +308,11 @@ mod tests {
         )
         .unwrap();
 
-        let report = review_tree(&ScanConfig::new(dir.path()), &unavailable());
+        let settings = default_settings();
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &unavailable()),
+        );
         assert_eq!(
             report.decide(&|class| builtin(Profile::Strict, class)),
             Decision::Blocked(Blocked::Incomplete)
@@ -280,7 +335,11 @@ mod tests {
         )
         .unwrap();
 
-        let report = review_tree(&ScanConfig::new(dir.path()), &unavailable());
+        let settings = default_settings();
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &unavailable()),
+        );
         let rules = rules_in(&report);
         assert!(rules.contains(&RuleId::ShellCommandExecution));
         assert!(rules.contains(&RuleId::CredentialFileAccess));
@@ -302,7 +361,11 @@ mod tests {
         fs::write(dir.path().join("theme.conf"), "name = \"good\"\n").unwrap();
 
         let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
-        let report = review_tree(&ScanConfig::new(dir.path()), &opencode);
+        let settings = default_settings();
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &opencode),
+        );
         assert!(report.gaps.is_empty(), "{:?}", report.gaps);
         assert!(matches!(
             report.agent_runs.as_slice(),
@@ -321,7 +384,11 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("main.lua"), "print('hi')\n").unwrap();
 
-        let report = review_tree(&ScanConfig::new(&dir), &unavailable());
+        let settings = default_settings();
+        let report = review_tree(
+            &ScanConfig::new(&dir),
+            &context(&settings, SourceClass::Source, &unavailable()),
+        );
         assert!(
             !report
                 .gaps
@@ -329,5 +396,79 @@ mod tests {
                 .any(|gap| matches!(gap, Gap::SensitiveWithheld(_)))
         );
         assert_eq!(report.agent_input.len(), 1);
+    }
+
+    #[test]
+    fn local_only_never_calls_the_agent() {
+        let dir = TempDir::new("local-only");
+        let bin = TempDir::new("local-only-bin");
+        fs::write(dir.path().join("theme.conf"), "name = \"good\"\n").unwrap();
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let settings = default_settings().with_profile(Profile::LocalOnly);
+
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Theme, &opencode),
+        );
+
+        assert!(report.agent_runs.is_empty());
+        assert!(!bin.path().join("stdin").exists());
+        assert_eq!(
+            report.decide(&|class| settings.policy(class)),
+            Decision::Clear
+        );
+    }
+
+    #[test]
+    fn the_input_limit_comes_from_settings() {
+        let dir = TempDir::new("input-limit");
+        fs::write(dir.path().join("big.txt"), "a".repeat(40 * 1024)).unwrap();
+        let system = PartialConfig {
+            agent: AgentDefaults {
+                max_input_kib: Some(16),
+                ..AgentDefaults::default()
+            },
+            ..PartialConfig::default()
+        };
+        let settings = Settings::from_parts(system, PartialConfig::default());
+
+        let report = review_tree(
+            &ScanConfig::new(dir.path()),
+            &context(&settings, SourceClass::Source, &unavailable()),
+        );
+        assert!(report.agent_input_overflowed);
+    }
+
+    #[test]
+    fn classes_with_equal_agent_settings_share_one_run() {
+        let bin = TempDir::new("grouped-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let settings = default_settings();
+
+        let mut report = Report::new("transaction");
+        report.class = SourceClass::ThirdPartyRepo;
+        report
+            .file_classes
+            .insert("a/.INSTALL".into(), SourceClass::Official);
+        report
+            .file_classes
+            .insert("b/.INSTALL".into(), SourceClass::LocalPackage);
+        report
+            .file_classes
+            .insert("c/.INSTALL".into(), SourceClass::ThirdPartyRepo);
+        for path in ["a/.INSTALL", "b/.INSTALL", "c/.INSTALL"] {
+            analyze_text(&mut report, path, "post_install() { true; }\n", false);
+        }
+
+        run_agents(&mut report, &settings, &opencode);
+
+        // Official uses low thinking; the other two share high thinking.
+        assert_eq!(report.agent_runs.len(), 2);
+        let files: Vec<&[String]> = report
+            .agent_runs
+            .iter()
+            .map(|run| run.files.as_slice())
+            .collect();
+        assert!(files.contains(&&["a/.INSTALL".to_string()][..]));
     }
 }
