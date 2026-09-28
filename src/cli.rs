@@ -515,11 +515,15 @@ fn parse_target(args: &[OsString], allowed: Allowed) -> Result<Target, String> {
                 let name = args
                     .next()
                     .ok_or("--unit needs a directory name and an identity")?;
-                let dir = parse_top_level_name("--unit", name)?;
-                units.push(Unit {
-                    prefix: format!("{dir}/"),
-                    identity: parse_identity("--unit", args.next())?,
-                });
+                let prefix = format!("{}/", parse_top_level_name("--unit", name)?);
+                let identity = parse_identity("--unit", args.next())?;
+                if units
+                    .iter()
+                    .any(|unit| unit.prefix == prefix || unit.identity == identity)
+                {
+                    return Err("--unit names each directory and each identity once".into());
+                }
+                units.push(Unit { prefix, identity });
             }
             Some("--profile") => {
                 let name = args
@@ -996,6 +1000,9 @@ mod tests {
             &["scan", "--unit", "a/b", "id", "dir"],
             &["scan", "--unit", "x"],
             &["scan", "--identity", "", "dir"],
+            &["scan", "--unit", "a", "X", "--unit", "b", "X", "dir"],
+            &["scan", "--unit", "a", "X", "--unit", "a", "Y", "dir"],
+            &["scan", "--unit", "a", "X", "--unit", "a", "X", "dir"],
         ] {
             assert!(parse(&args(bad)).is_err(), "accepted {bad:?}");
         }

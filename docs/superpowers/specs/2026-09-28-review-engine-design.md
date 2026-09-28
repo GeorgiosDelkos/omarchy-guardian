@@ -237,6 +237,8 @@ Verdict entry (JSON, written with the in-crate JSON writer): `key`,
   - Without either flag: `<class>:<canonical path of the target>`.
   - Plugins (sub-project 3 of 4) will use `plugin:<plugin id>`.
 - Identities are 1 to 512 bytes without control characters.
+- `--unit` names each directory and each identity once; a repeated
+  directory or identity is a usage error.
 - A baseline is recorded only when every chunk got an AI `clear` (live or
   cached), the report has no gaps, and the decision is `Clear`.
 - A baseline is bound to the `PROMPT_VERSION` and the agent settings the
