@@ -76,3 +76,13 @@ printf '{{"type":"text","part":{{"type":"text","text":"%s"}}}}\n' "$escaped"
     );
     binary
 }
+
+/// A fake `opencode` that fails the way a provider or model error does.
+pub fn mock_opencode_failing(dir: &Path, stderr: &str) -> PathBuf {
+    let binary = dir.join("opencode");
+    write_script(
+        &binary,
+        &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{stderr}' >&2\nexit 1\n"),
+    );
+    binary
+}

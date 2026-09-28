@@ -1,7 +1,8 @@
 //! The review pipeline shared by every command: local rules, dependency
 //! audit, then the OpenCode review.
 
-use crate::agent::{self, SourceFile};
+use crate::agent::{self, AgentError, SourceFile};
+use crate::config::model::AgentSettings;
 use crate::deps;
 use crate::osv;
 use crate::report::{Gap, LocalFinding, NetworkRequest, Report};
@@ -131,9 +132,10 @@ pub fn run_agent(report: &mut Report, opencode: &OpenCode) {
         return;
     }
 
-    let result = opencode
-        .resolve()
-        .and_then(|binary| agent::review(&binary, &report.agent_input));
+    let result = opencode.resolve().and_then(|binary| {
+        agent::review(&binary, &report.agent_input, &AgentSettings::default())
+            .map_err(AgentError::into_error)
+    });
     match result {
         Ok(review) => report.agent = Some(review),
         Err(error) => report.gaps.push(Gap::Agent(error)),
