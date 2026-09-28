@@ -200,7 +200,8 @@ For user-level sources (AUR, themes, plugins and `scan`/`guard`/`sandbox`
 targets), Guardian keeps a review memory in
 `$XDG_STATE_HOME/omarchy-guardian`, default
 `~/.local/state/omarchy-guardian`, mode 0700. Guardian creates it (and any
-missing parents) only under an existing directory you own, so a run under
+missing parents) only under an existing directory you own (a symlink counts
+as its target), so a run under
 `sudo -E` leaves nothing owned by root in your home; otherwise the report
 says the memory was not used and the review runs in full:
 
@@ -215,16 +216,17 @@ says the memory was not used and the review runs in full:
   rules and the dependency audit still read every file. A baseline only
   counts under the prompt version, model, variant and thinking level that
   approved it; after any of them changes, the next review is a full one. A
-  source identical to its baseline is sent whole, as a first review, so the
-  cache can answer a repeat of that review. The `strict` profile turns diff
+  source identical to its baseline is answered from the cache when its first
+  review is still cached (yay's second `makepkg` pass); otherwise it is
+  reviewed as an upgrade like any other. The `strict` profile turns diff
   review off.
 
 The AUR gate remembers a build by yay's build directory name, and the theme
 handler remembers a theme by its name. Other targets are remembered by their
 class and path. `omarchy-guardian forget ID` drops one source's baselines
 but keeps cached verdicts, so an unchanged rebuild can still be answered from
-the cache; `omarchy-guardian forget --all` also clears every cached verdict. `config
-show` prints the memory's location and size.
+the cache; `omarchy-guardian forget --all` also clears every cached verdict.
+`config show` prints the memory's location and size.
 
 The pacman gate never uses this memory: every scriptlet gets a fresh, full
 review. Because the memory lives in your home directory, malware already

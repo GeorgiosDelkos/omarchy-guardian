@@ -259,16 +259,18 @@ impl Store {
 }
 
 /// Creates the store directory and any missing parents (mode 0700), but only
-/// when the nearest existing ancestor is a real directory (not a symlink)
-/// owned by `uid`. Under `sudo -E` (euid 0, the user's HOME kept) that
-/// ancestor belongs to the user, so nothing root-owned is created there.
+/// when the nearest existing ancestor is a directory (a symlink to one, such
+/// as a symlinked HOME, counts as its target) owned by `uid`. Under `sudo -E`
+/// (euid 0, the user's HOME kept) that ancestor belongs to the user, so
+/// nothing root-owned is created there. The store root itself is still
+/// checked without following symlinks by `Store::open`.
 fn create_root(root: &Path, uid: u32) -> Result<(), String> {
     let ancestor = nearest_existing_ancestor(root)?;
-    let metadata = fs::symlink_metadata(&ancestor)
-        .map_err(|error| format!("{}: {error}", ancestor.display()))?;
-    if !metadata.file_type().is_dir() {
+    let metadata =
+        fs::metadata(&ancestor).map_err(|error| format!("{}: {error}", ancestor.display()))?;
+    if !metadata.is_dir() {
         return Err(format!(
-            "{} is not a real directory; not creating the store under it",
+            "{} is not a directory; not creating the store under it",
             ancestor.display()
         ));
     }
@@ -392,17 +394,34 @@ mod tests {
     }
 
     #[test]
-    fn a_store_is_not_created_under_a_symlinked_ancestor() {
+    fn a_symlinked_ancestor_counts_as_its_target() {
         let dir = TempDir::new("store-symlink-parent");
         let real = dir.path().join("real");
         fs::create_dir(&real).unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let root = link.join("state").join("omarchy-guardian");
 
-        let error = Store::open(root).err().unwrap();
-        assert!(error.contains("not a real directory"), "{error}");
-        assert!(!real.join("state").exists());
+        Store::open(link.join("state").join("omarchy-guardian")).unwrap();
+        assert!(
+            real.join("state")
+                .join("omarchy-guardian")
+                .join(BASELINES)
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn a_store_is_not_created_under_a_file() {
+        let dir = TempDir::new("store-file-parent");
+        let file = dir.path().join("file");
+        fs::write(&file, b"x").unwrap();
+
+        let error = Store::open(file.join("state").join("omarchy-guardian"))
+            .err()
+            .unwrap();
+        // The kernel refuses the path itself (ENOTDIR) before any ancestor
+        // check; either way nothing is created.
+        assert!(error.to_lowercase().contains("not a directory"), "{error}");
     }
 
     #[test]

@@ -128,8 +128,12 @@ Within a tier, files sort by path so plans are deterministic.
 Applies only when the class's `diff` knob is `on`, the target has an
 identity, and a valid baseline exists for it. A tree identical to its
 baseline (the same paths with the same content) is planned as a first
-review instead: that is the same request that produced the baseline, so the
-verdict cache can answer it (yay's second `makepkg` pass, for one).
+review only when the verdict cache answers every chunk of that first-review
+plan (the baseline came from a first review, as on yay's second `makepkg`
+pass over a first install). Otherwise, including when the first-review plan
+would be over `max_chunks`, the normal upgrade plan is used: a baseline
+approved by an upgrade review never turns an unchanged rerun into a larger
+full review.
 
 | File | Sent as |
 |---|---|
@@ -185,8 +189,9 @@ The reply format is unchanged.
   to group or others, the store is not used for this run and the report
   carries a note (section 11).
 - A missing store directory, with any missing parents, is created (mode
-  0700) only when the nearest existing ancestor is a real directory (not a
-  symlink) owned by the effective user; otherwise the store is not used for
+  0700) only when the nearest existing ancestor is a directory (a symlink
+  counts as its target) owned by the effective user; the store directory
+  itself must not be a symlink. Otherwise the store is not used for
   this run and the report carries a note. Under `sudo -E` (HOME kept, euid
   0), that ancestor belongs to the user, so a root run never leaves
   root-owned directories in the user's home.
@@ -315,7 +320,7 @@ review in the same run.
 
 | Failure | Result |
 |---|---|
-| Store unreadable, unwritable, wrong owner or mode; store missing and its nearest existing ancestor not a real directory owned by the current user | No cache, no baseline, full review; a note in the report |
+| Store unreadable, unwritable, wrong owner or mode; store missing and its nearest existing ancestor not a directory owned by the current user | No cache, no baseline, full review; a note in the report |
 | Corrupt baseline or blob hash mismatch | Baseline deleted, full review |
 | Diff input over 1 MiB, or a trimmed middle over 4,000,000 table cells | That file sent whole |
 | Any chunk invalid | Whole review blocked (existing invalid outcome); nothing cached from this run |
@@ -324,8 +329,9 @@ review in the same run.
 
 Notes (store problems, the upgrade summary, and on an upgrade with nothing
 to send "every file is unchanged since the approved version; no AI call was
-needed") are printed as `Review memory:` lines. They are not gaps: they never make a review incomplete, because the
-review itself still ran in full.
+needed") are printed as `Review memory:` lines. They are not gaps: they
+never make a review incomplete, because the review itself still ran in
+full.
 
 ## 12. Testing
 
