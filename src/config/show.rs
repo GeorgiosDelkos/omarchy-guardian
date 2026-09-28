@@ -140,7 +140,7 @@ mod tests {
     use super::{render_check, render_memory, render_show};
     use crate::agent::SourceFile;
     use crate::config::Settings;
-    use crate::config::model::SourceClass;
+    use crate::config::model::{AgentSettings, SourceClass};
     use crate::engine::baseline::{self, Identity, Unit};
     use crate::engine::store::Store;
     use crate::test_support::TempDir;
@@ -217,7 +217,15 @@ mod tests {
             path: "PKGBUILD".into(),
             content: "x\n".into(),
         }];
-        baseline::record(&store, SourceClass::Aur, &[unit], &files, 1).unwrap();
+        baseline::record(
+            &store,
+            SourceClass::Aur,
+            &[unit],
+            &files,
+            &AgentSettings::default(),
+            1,
+        )
+        .unwrap();
 
         assert!(render_memory(Some(&root)).contains("1 approved baseline(s)"));
         assert!(render_memory(None).contains("no state directory"));

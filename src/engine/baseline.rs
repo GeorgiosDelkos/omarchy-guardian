@@ -1,19 +1,22 @@
 //! Approved snapshots. After a complete, all-clear AI review of a
 //! user-level source, its reviewed files are kept so the next version can be
-//! reviewed as a diff against them.
+//! reviewed as a diff against them. A baseline is bound to the prompt
+//! version and the agent settings it was approved under: a stronger model or
+//! a new prompt never inherits an older review's approval.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::str;
 
 use crate::agent::SourceFile;
-use crate::config::model::{Named, SourceClass};
+use crate::config::model::{AgentSettings, Named, SourceClass};
 use crate::engine::plan::Previous;
+use crate::engine::request::PROMPT_VERSION;
 use crate::engine::store::{BASELINES, BLOBS, Store, VERDICTS, is_hex_digest};
 use crate::error::Error;
 use crate::sha256::Sha256;
 
-const FORMAT: &str = "omarchy-guardian-baseline 1";
+const FORMAT: &str = "omarchy-guardian-baseline 2";
 const MAX_IDENTITY_BYTES: usize = 512;
 
 /// What a reviewed source is remembered as, such as `aur:yay-bin`.
@@ -46,9 +49,24 @@ pub struct Unit {
 
 struct Manifest {
     identity: String,
+    prompt: u32,
+    /// `fingerprint` of the agent settings the files were approved under.
+    settings: String,
     recorded: u64,
     /// (blob digest, path) per file.
     files: Vec<(String, String)>,
+}
+
+/// The agent settings a verdict depends on (the same ones `cache::key`
+/// hashes besides the class and request), as a hex SHA-256.
+pub fn fingerprint(settings: &AgentSettings) -> String {
+    let text = format!(
+        "omarchy-guardian-baseline-settings\0{}\0{}\0{}\0",
+        settings.model.as_deref().unwrap_or_default(),
+        settings.variant.as_deref().unwrap_or_default(),
+        settings.thinking.name()
+    );
+    Sha256::digest(text.as_bytes()).to_string()
 }
 
 fn manifest_name(class: SourceClass, identity: &Identity) -> String {
@@ -65,6 +83,12 @@ fn parse_manifest(text: &str) -> Option<Manifest> {
         return None;
     }
     let identity = lines.next()?.strip_prefix("identity ")?.to_string();
+    let prompt = lines.next()?.strip_prefix("prompt ")?.parse().ok()?;
+    let settings = lines.next()?.strip_prefix("settings ")?;
+    if !is_hex_digest(settings) {
+        return None;
+    }
+    let settings = settings.to_string();
     let recorded = lines.next()?.strip_prefix("recorded ")?.parse().ok()?;
     let mut files = Vec::new();
     for line in lines {
@@ -81,6 +105,8 @@ fn parse_manifest(text: &str) -> Option<Manifest> {
     }
     Some(Manifest {
         identity,
+        prompt,
+        settings,
         recorded,
         files,
     })
@@ -95,9 +121,16 @@ fn read_manifest(store: &Store, name: &str) -> Result<Option<Manifest>, Error> {
 
 /// The approved files of every unit that has a baseline, keyed by their
 /// path in the reviewed tree; `None` when no unit has one. A baseline that
-/// does not parse, names another identity, or has a missing or corrupt blob
-/// is deleted.
-pub fn load(store: &Store, class: SourceClass, units: &[Unit]) -> Result<Option<Previous>, Error> {
+/// does not parse (including an older format), names another identity, was
+/// approved under another prompt version or other agent `settings`, or has
+/// a missing or corrupt blob is deleted.
+pub fn load(
+    store: &Store,
+    class: SourceClass,
+    units: &[Unit],
+    settings: &AgentSettings,
+) -> Result<Option<Previous>, Error> {
+    let expected = fingerprint(settings);
     let mut previous = Previous::new();
     let mut found = false;
     for unit in units {
@@ -105,7 +138,7 @@ pub fn load(store: &Store, class: SourceClass, units: &[Unit]) -> Result<Option<
         if store.read(BASELINES, &name)?.is_none() {
             continue;
         }
-        if let Some(files) = load_unit(store, &name, unit)? {
+        if let Some(files) = load_unit(store, &name, unit, &expected)? {
             found = true;
             previous.extend(files);
         } else {
@@ -119,11 +152,15 @@ fn load_unit(
     store: &Store,
     name: &str,
     unit: &Unit,
+    fingerprint: &str,
 ) -> Result<Option<Vec<(String, String)>>, Error> {
     let Some(manifest) = read_manifest(store, name)? else {
         return Ok(None);
     };
-    if manifest.identity != unit.identity.as_str() {
+    if manifest.identity != unit.identity.as_str()
+        || manifest.prompt != PROMPT_VERSION
+        || manifest.settings != fingerprint
+    {
         return Ok(None);
     }
     let mut files = Vec::with_capacity(manifest.files.len());
@@ -139,7 +176,9 @@ fn load_unit(
     Ok(Some(files))
 }
 
-/// Records each unit's reviewed files as its approved version. Paths that
+/// Records each unit's reviewed files as its approved version under the
+/// current prompt version and the agent `settings` they were reviewed with.
+/// Paths that
 /// contain a newline or a carriage return cannot be listed in a manifest
 /// and are left out, so they are reviewed whole next time (`str::lines`
 /// strips a trailing '\r' too, so such a path would otherwise round-trip
@@ -149,11 +188,13 @@ pub fn record(
     class: SourceClass,
     units: &[Unit],
     files: &[SourceFile],
+    settings: &AgentSettings,
     now: u64,
 ) -> Result<(), Error> {
+    let approved_under = fingerprint(settings);
     for unit in units {
         let mut text = format!(
-            "{FORMAT}\nidentity {}\nrecorded {now}\n",
+            "{FORMAT}\nidentity {}\nprompt {PROMPT_VERSION}\nsettings {approved_under}\nrecorded {now}\n",
             unit.identity.as_str()
         );
         for file in files {
@@ -241,9 +282,10 @@ pub fn collect_garbage(store: &Store, max_bytes: u64, now: u64) -> Result<(), Er
 
 #[cfg(test)]
 mod tests {
-    use super::{Identity, Unit, collect_garbage, forget, forget_all, load, record};
+    use super::{Identity, Unit, collect_garbage, fingerprint, forget, forget_all, load, record};
     use crate::agent::SourceFile;
-    use crate::config::model::SourceClass;
+    use crate::config::model::{AgentSettings, SourceClass, Thinking};
+    use crate::engine::request::PROMPT_VERSION;
     use crate::engine::store::{BASELINES, BLOBS, Store, VERDICTS};
     use crate::test_support::TempDir;
 
@@ -259,6 +301,10 @@ mod tests {
             prefix: prefix.into(),
             identity: Identity::parse(identity).unwrap(),
         }
+    }
+
+    fn settings() -> AgentSettings {
+        AgentSettings::default()
     }
 
     fn store(dir: &TempDir) -> Store {
@@ -278,21 +324,30 @@ mod tests {
         let dir = TempDir::new("baseline-roundtrip");
         let store = store(&dir);
         let units = [unit("", "aur:demo")];
-        assert_eq!(load(&store, SourceClass::Aur, &units).unwrap(), None);
+        assert_eq!(
+            load(&store, SourceClass::Aur, &units, &settings()).unwrap(),
+            None
+        );
 
         record(
             &store,
             SourceClass::Aur,
             &units,
             &[file("PKGBUILD", "p\n"), file("src/a.c", "a\n")],
+            &settings(),
             5,
         )
         .unwrap();
 
-        let previous = load(&store, SourceClass::Aur, &units).unwrap().unwrap();
+        let previous = load(&store, SourceClass::Aur, &units, &settings())
+            .unwrap()
+            .unwrap();
         assert_eq!(previous.get("PKGBUILD").map(String::as_str), Some("p\n"));
         assert_eq!(previous.get("src/a.c").map(String::as_str), Some("a\n"));
-        assert_eq!(load(&store, SourceClass::Theme, &units).unwrap(), None);
+        assert_eq!(
+            load(&store, SourceClass::Theme, &units, &settings()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -305,11 +360,14 @@ mod tests {
             SourceClass::Theme,
             &good,
             &[file("good/colors.toml", "c\n"), file("bad/x.lua", "x\n")],
+            &settings(),
             1,
         )
         .unwrap();
 
-        let previous = load(&store, SourceClass::Theme, &good).unwrap().unwrap();
+        let previous = load(&store, SourceClass::Theme, &good, &settings())
+            .unwrap()
+            .unwrap();
         let paths: Vec<&str> = previous.keys().map(String::as_str).collect();
         assert_eq!(paths, ["good/colors.toml"]);
     }
@@ -328,11 +386,14 @@ mod tests {
                 file("bad\nname.c", "b\n"),
                 file("bad\rname.c", "c\n"),
             ],
+            &settings(),
             1,
         )
         .unwrap();
 
-        let previous = load(&store, SourceClass::Source, &units).unwrap().unwrap();
+        let previous = load(&store, SourceClass::Source, &units, &settings())
+            .unwrap()
+            .unwrap();
         let paths: Vec<&str> = previous.keys().map(String::as_str).collect();
         assert_eq!(paths, ["my file.c"]);
     }
@@ -347,13 +408,17 @@ mod tests {
             SourceClass::Aur,
             &units,
             &[file("PKGBUILD", "p\n")],
+            &settings(),
             1,
         )
         .unwrap();
         for blob in store.list(BLOBS).unwrap() {
             store.write(BLOBS, &blob, b"tampered").unwrap();
         }
-        assert_eq!(load(&store, SourceClass::Aur, &units).unwrap(), None);
+        assert_eq!(
+            load(&store, SourceClass::Aur, &units, &settings()).unwrap(),
+            None
+        );
         assert!(store.list(BASELINES).unwrap().is_empty());
 
         // A manifest copied under another identity's name is not trusted.
@@ -362,13 +427,14 @@ mod tests {
             SourceClass::Aur,
             &units,
             &[file("PKGBUILD", "p\n")],
+            &settings(),
             1,
         )
         .unwrap();
         let name = store.list(BASELINES).unwrap().remove(0);
         let bytes = store.read(BASELINES, &name).unwrap().unwrap();
         let other = [unit("", "aur:other")];
-        record(&store, SourceClass::Aur, &other, &[], 1).unwrap();
+        record(&store, SourceClass::Aur, &other, &[], &settings(), 1).unwrap();
         let other_name = store
             .list(BASELINES)
             .unwrap()
@@ -376,7 +442,86 @@ mod tests {
             .find(|candidate| *candidate != name)
             .unwrap();
         store.write(BASELINES, &other_name, &bytes).unwrap();
-        assert_eq!(load(&store, SourceClass::Aur, &other).unwrap(), None);
+        assert_eq!(
+            load(&store, SourceClass::Aur, &other, &settings()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_baseline_approved_under_other_settings_or_prompt_is_deleted() {
+        let dir = TempDir::new("baseline-settings");
+        let store = store(&dir);
+        let units = [unit("", "aur:demo")];
+        let files = [file("PKGBUILD", "p\n")];
+        let others = [
+            AgentSettings {
+                thinking: Thinking::Max,
+                ..AgentSettings::default()
+            },
+            AgentSettings {
+                model: Some("a/b".into()),
+                ..AgentSettings::default()
+            },
+            AgentSettings {
+                variant: Some("deep".into()),
+                ..AgentSettings::default()
+            },
+        ];
+        for other in &others {
+            record(&store, SourceClass::Aur, &units, &files, &settings(), 1).unwrap();
+            assert!(
+                load(&store, SourceClass::Aur, &units, &settings())
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(load(&store, SourceClass::Aur, &units, other).unwrap(), None);
+            assert!(store.list(BASELINES).unwrap().is_empty(), "{other:?}");
+        }
+
+        // A manifest approved under another prompt version is not trusted.
+        record(&store, SourceClass::Aur, &units, &files, &settings(), 1).unwrap();
+        let name = store.list(BASELINES).unwrap().remove(0);
+        let text = String::from_utf8(store.read(BASELINES, &name).unwrap().unwrap()).unwrap();
+        let older_prompt = text.replace(
+            &format!("\nprompt {PROMPT_VERSION}\n"),
+            &format!("\nprompt {}\n", PROMPT_VERSION - 1),
+        );
+        assert_ne!(older_prompt, text);
+        store
+            .write(BASELINES, &name, older_prompt.as_bytes())
+            .unwrap();
+        assert_eq!(
+            load(&store, SourceClass::Aur, &units, &settings()).unwrap(),
+            None
+        );
+        assert!(store.list(BASELINES).unwrap().is_empty());
+
+        // A format-1 manifest (no prompt or settings) is no baseline.
+        let format_one = text
+            .replace(
+                "omarchy-guardian-baseline 2\n",
+                "omarchy-guardian-baseline 1\n",
+            )
+            .replace(
+                &format!(
+                    "prompt {PROMPT_VERSION}\nsettings {}\n",
+                    fingerprint(&settings())
+                ),
+                "",
+            );
+        assert!(
+            format_one
+                .starts_with("omarchy-guardian-baseline 1\nidentity aur:demo\nrecorded 1\nfile ")
+        );
+        store
+            .write(BASELINES, &name, format_one.as_bytes())
+            .unwrap();
+        assert_eq!(
+            load(&store, SourceClass::Aur, &units, &settings()).unwrap(),
+            None
+        );
+        assert!(store.list(BASELINES).unwrap().is_empty());
     }
 
     #[test]
@@ -389,6 +534,7 @@ mod tests {
             SourceClass::Aur,
             &units,
             &[file("PKGBUILD", "p\n")],
+            &settings(),
             1,
         )
         .unwrap();
@@ -402,6 +548,7 @@ mod tests {
             SourceClass::Aur,
             &units,
             &[file("PKGBUILD", "p\n")],
+            &settings(),
             1,
         )
         .unwrap();
@@ -420,6 +567,7 @@ mod tests {
             SourceClass::Aur,
             &[unit("", "aur:old")],
             &[file("a", "old\n")],
+            &settings(),
             1,
         )
         .unwrap();
@@ -428,6 +576,7 @@ mod tests {
             SourceClass::Aur,
             &[unit("", "aur:new")],
             &[file("a", "new\n")],
+            &settings(),
             2,
         )
         .unwrap();
@@ -448,14 +597,24 @@ mod tests {
         };
         collect_garbage(&store, size_of_newest, 1).unwrap();
         assert!(
-            load(&store, SourceClass::Aur, &[unit("", "aur:old")])
-                .unwrap()
-                .is_none()
+            load(
+                &store,
+                SourceClass::Aur,
+                &[unit("", "aur:old")],
+                &settings()
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
-            load(&store, SourceClass::Aur, &[unit("", "aur:new")])
-                .unwrap()
-                .is_some()
+            load(
+                &store,
+                SourceClass::Aur,
+                &[unit("", "aur:new")],
+                &settings()
+            )
+            .unwrap()
+            .is_some()
         );
 
         collect_garbage(&store, 0, 1).unwrap();

@@ -117,7 +117,7 @@ pub fn review_group(
     // the store) must hold here too, not only via `Memory::open`.
     let memory = memory.filter(|_| !group.class.is_privileged());
     let mut review = GroupReview::default();
-    let previous = previous_version(memory, &mut review.notes);
+    let previous = previous_version(memory, group.settings, &mut review.notes);
     let flagged: BTreeSet<String> = group
         .findings
         .iter()
@@ -202,10 +202,15 @@ pub fn review_group(
     review
 }
 
-/// The approved version to diff against, when this review uses diffs.
-fn previous_version(memory: Option<&Memory>, notes: &mut Vec<String>) -> Option<Previous> {
+/// The approved version to diff against, when this review uses diffs and
+/// the baseline was approved under these agent settings.
+fn previous_version(
+    memory: Option<&Memory>,
+    settings: &AgentSettings,
+    notes: &mut Vec<String>,
+) -> Option<Previous> {
     let memory = memory.filter(|memory| memory.use_diff)?;
-    match baseline::load(&memory.store, memory.class, &memory.units) {
+    match baseline::load(&memory.store, memory.class, &memory.units, settings) {
         Ok(previous) => previous,
         Err(error) => {
             notes.push(format!(
@@ -331,17 +336,20 @@ impl Runner<'_> {
     }
 }
 
-/// After the whole review: keep `approved` as the baseline (the caller
-/// passes it only after every chunk was clear, with no gaps and a clear
-/// decision), then prune the store. Returns notes for the report.
-pub fn remember(memory: &Memory, approved: Option<&[SourceFile]>) -> Vec<String> {
+/// After the whole review: keep `approved` as the baseline, bound to the
+/// agent settings every file was reviewed with (the caller passes it only
+/// after every chunk was clear, with no gaps and a clear decision, and all
+/// files shared one set of settings), then prune the store. Returns notes
+/// for the report.
+pub fn remember(memory: &Memory, approved: Option<(&[SourceFile], &AgentSettings)>) -> Vec<String> {
     let mut notes = Vec::new();
-    if let Some(files) = approved.filter(|_| memory.use_diff)
+    if let Some((files, settings)) = approved.filter(|_| memory.use_diff)
         && let Err(error) = baseline::record(
             &memory.store,
             memory.class,
             &memory.units,
             files,
+            settings,
             memory.now,
         )
     {
@@ -371,7 +379,7 @@ mod tests {
     use crate::agent::SourceFile;
     use crate::config::Settings;
     use crate::config::file::{AgentDefaults, PartialConfig};
-    use crate::config::model::{AgentSettings, Profile, SourceClass};
+    use crate::config::model::{AgentSettings, Profile, SourceClass, Thinking};
     use crate::engine::baseline::{self, Identity, Unit};
     use crate::engine::store::{Store, VERDICTS};
     use crate::report::AgentOutcome;
@@ -559,7 +567,7 @@ mod tests {
                 .len(),
             1
         );
-        assert!(remember(&memory, Some(&first)).is_empty());
+        assert!(remember(&memory, Some((&first, &settings))).is_empty());
 
         let upgraded = [
             file("PKGBUILD", "pkgname=demo\n"),
@@ -582,6 +590,47 @@ mod tests {
         assert!(sent.contains(r#""path":"src/lib.c","kind":"diff""#));
         assert!(sent.contains(r#""path":"PKGBUILD","kind":"whole""#));
         assert!(sent.contains("-int value_20 = 20;"));
+    }
+
+    #[test]
+    fn a_baseline_approved_under_other_agent_settings_is_not_diffed_against() {
+        let state = TempDir::new("engine-other-settings");
+        let bin = TempDir::new("engine-other-settings-bin");
+        let opencode = OpenCode::At(mock_opencode(bin.path(), "clear", true));
+        let memory = memory(&state, units("aur:demo"));
+        let weaker = AgentSettings::default();
+        let stronger = AgentSettings {
+            thinking: Thinking::Max,
+            ..AgentSettings::default()
+        };
+        let approved = [
+            file("PKGBUILD", "pkgname=demo\n"),
+            file("src/lib.c", "int a;\n"),
+        ];
+        assert!(remember(&memory, Some((&approved, &weaker))).is_empty());
+
+        let upgraded = [
+            file("PKGBUILD", "pkgname=demo\n"),
+            file("src/lib.c", "int a;\n"),
+            file("src/new.c", "int b;\n"),
+        ];
+        let review = review_group(&group(&stronger, &upgraded), &opencode, Some(&memory));
+
+        assert!(
+            !review.notes.iter().any(|note| note.contains("upgrade")),
+            "{:?}",
+            review.notes
+        );
+        let sent = fs::read_to_string(bin.path().join("stdin")).unwrap();
+        assert!(sent.contains("This is the first review"));
+        assert!(sent.contains(r#""path":"src/lib.c","kind":"whole""#));
+        // The mismatched baseline is gone, so a later review under the old
+        // settings cannot fall back to it either.
+        assert!(
+            baseline::load(&memory.store, SourceClass::Aur, &memory.units, &weaker)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -609,19 +658,19 @@ mod tests {
         let removed_files: Vec<SourceFile> = (0..5)
             .map(|index| file(&format!("removed-{index}.c"), "old\n"))
             .collect();
+        let settings = AgentSettings {
+            max_input_bytes: 400,
+            ..AgentSettings::default()
+        };
         baseline::record(
             &memory.store,
             SourceClass::Aur,
             &memory.units,
             &removed_files,
+            &settings,
             memory.now,
         )
         .unwrap();
-
-        let settings = AgentSettings {
-            max_input_bytes: 400,
-            ..AgentSettings::default()
-        };
         let files = [file("a.c", "hi\n")];
 
         let review = review_group(&group(&settings, &files), &opencode, Some(&memory));
@@ -666,18 +715,19 @@ mod tests {
     fn remember_records_a_baseline_only_when_approved() {
         let state = TempDir::new("engine-remember");
         let memory = memory(&state, units("aur:demo"));
+        let settings = AgentSettings::default();
         let files = [file("PKGBUILD", "pkgname=demo\n")];
 
         assert!(remember(&memory, None).is_empty());
         assert!(
-            baseline::load(&memory.store, SourceClass::Aur, &memory.units)
+            baseline::load(&memory.store, SourceClass::Aur, &memory.units, &settings)
                 .unwrap()
                 .is_none()
         );
 
-        assert!(remember(&memory, Some(&files)).is_empty());
+        assert!(remember(&memory, Some((&files, &settings))).is_empty());
         assert!(
-            baseline::load(&memory.store, SourceClass::Aur, &memory.units)
+            baseline::load(&memory.store, SourceClass::Aur, &memory.units, &settings)
                 .unwrap()
                 .is_some()
         );

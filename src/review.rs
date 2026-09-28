@@ -70,7 +70,7 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
             None
         }
     };
-    run_agents(
+    let reviewed_with = run_agents(
         &mut report,
         context.settings,
         context.opencode,
@@ -78,8 +78,10 @@ pub fn review_tree(config: &ScanConfig, context: &ReviewContext<'_>) -> Report {
         memory.as_ref(),
     );
     if let Some(memory) = &memory {
-        let approved =
-            is_approved(&report, context.settings).then_some(report.agent_input.as_slice());
+        let approved = reviewed_with
+            .as_ref()
+            .filter(|_| is_approved(&report, context.settings))
+            .map(|settings| (report.agent_input.as_slice(), settings));
         let notes = engine::remember(memory, approved);
         report.notes.extend(notes);
     }
@@ -183,16 +185,21 @@ fn audit_dependencies(report: &mut Report) {
 /// Runs the AI review for every file whose class policy wants one. Files
 /// whose classes resolve to the same agent settings share one plan. A tree
 /// with an oversized text file is already incomplete, so nothing is sent.
+///
+/// Returns the agent settings every queued file was reviewed with, or
+/// `None` when nothing was reviewed or the files needed more than one set
+/// of settings (a baseline is bound to one set, so such a review is never
+/// recorded as one).
 pub fn run_agents(
     report: &mut Report,
     settings: &Settings,
     opencode: &OpenCode,
     units: &[Unit],
     memory: Option<&Memory>,
-) {
+) -> Option<AgentSettings> {
     let has_oversized = report.snapshot.count(FileKind::OversizedText) > 0;
     if report.agent_input.is_empty() || has_oversized {
-        return;
+        return None;
     }
 
     let mut groups: Vec<(AgentSettings, Vec<SourceFile>)> = Vec::new();
@@ -211,6 +218,10 @@ pub fn run_agents(
         }
     }
 
+    let reviewed_with = match groups.as_slice() {
+        [(only, files)] if files.len() == report.agent_input.len() => Some(only.clone()),
+        _ => None,
+    };
     for (agent_settings, files) in groups {
         let findings: Vec<LocalFinding> = report
             .findings
@@ -236,6 +247,7 @@ pub fn run_agents(
         }
         report.agent_runs.extend(reviewed.runs);
     }
+    reviewed_with
 }
 
 /// The class a group is reviewed as: its files' class when they share one,

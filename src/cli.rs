@@ -627,7 +627,7 @@ mod tests {
     use crate::agent::SourceFile;
     use crate::config::Settings;
     use crate::config::file::{PartialConfig, PartialPolicy};
-    use crate::config::model::{AiRequirement, Profile, SourceClass};
+    use crate::config::model::{AgentSettings, AiRequirement, Profile, SourceClass};
     use crate::engine::baseline::{self, Identity, Unit};
     use crate::engine::store::Store;
     use crate::report::{Blocked, Decision};
@@ -1035,6 +1035,7 @@ mod tests {
             SourceClass::Aur,
             std::slice::from_ref(&unit),
             &files,
+            &AgentSettings::default(),
             1,
         )
         .unwrap();
@@ -1044,7 +1045,7 @@ mod tests {
             ExitCode::SUCCESS
         );
         assert!(
-            baseline::load(&store, SourceClass::Aur, &[unit])
+            baseline::load(&store, SourceClass::Aur, &[unit], &AgentSettings::default())
                 .unwrap()
                 .is_none()
         );

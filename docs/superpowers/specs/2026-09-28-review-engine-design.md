@@ -192,12 +192,17 @@ verdicts/<cache-key>                   one cached chunk verdict
 Baseline manifest (text, one record per line):
 
 ```
-omarchy-guardian-baseline 1
+omarchy-guardian-baseline 2
 identity <identity>
+prompt <PROMPT_VERSION>
+settings <sha256 of model, variant and thinking level>
 recorded <unix seconds>
 file <sha256> <size> <path>
 ...
 ```
+
+A manifest in any other format (including format 1, which had no `prompt`
+or `settings` line) does not parse, so it is no baseline.
 
 Verdict entry (JSON, written with the in-crate JSON writer): `key`,
 `status`, `summary`, `findings`, `model` label, `recorded` unix seconds.
@@ -231,6 +236,12 @@ Verdict entry (JSON, written with the in-crate JSON writer): `key`,
 - Identities are 1 to 512 bytes without control characters.
 - A baseline is recorded only when every chunk got an AI `clear` (live or
   cached), the report has no gaps, and the decision is `Clear`.
+- A baseline is bound to the `PROMPT_VERSION` and the agent settings the
+  verdict cache keys on (model, variant, thinking level) that approved it.
+  A review under another prompt version or other settings treats it as no
+  baseline: it is deleted and the review runs in full, so a stronger
+  reviewer is always shown every file. A review whose files needed more than
+  one set of agent settings records no baseline.
 - A manifest that does not parse, or a blob whose hash does not match, means
   no baseline: that baseline is deleted and the review runs in full.
 
