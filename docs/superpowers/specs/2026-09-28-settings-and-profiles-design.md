@@ -157,8 +157,10 @@ For each class, each knob resolves as:
    - **user-level classes**: an explicit user value overrides;
    - **privileged classes**: a user value applies only if it is at least as
      strict as the value from steps 1–2; otherwise it is ignored with a warning.
-     `model`, `[agent]`, `[agent.variants]` and `official_repos` are never taken
-     from the user file for privileged classes.
+     `thinking`, `model`, `timeout_secs`, `[agent]`, `[agent.variants]` and
+     `official_repos` are system-only for privileged classes: never taken from
+     the user file or a user profile, tighter or not (a level or model the
+     provider rejects would make the root gate's review unavailable).
 
 The effective profile is the system file's `profile` (default `standard`). A
 user `profile` applies to user-level classes, and to privileged classes only

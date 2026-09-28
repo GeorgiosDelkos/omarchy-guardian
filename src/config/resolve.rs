@@ -128,17 +128,19 @@ impl Resolved {
             &mut self.origins,
             &mut self.ignored,
         );
-        tighten_knob(
-            &mut self.policy.thinking,
-            values.thinking,
-            "thinking",
-            source,
-            &mut self.origins,
-            &mut self.ignored,
-        );
 
-        // Model and timeout for pacman-enforced classes come only from the
-        // system file; the user layer can never supply them, tighter or not.
+        // Thinking, model and timeout for pacman-enforced classes come only
+        // from the system file; the user layer can never supply them, tighter
+        // or not, because a level or model the provider rejects would make
+        // the root gate's review unavailable.
+        if let Some(thinking) = values.thinking
+            && thinking != self.policy.thinking
+        {
+            self.ignored.push(format!(
+                "thinking = {} ignored ({source}): only the system file sets it for pacman-enforced classes",
+                thinking.name()
+            ));
+        }
         if let Some(model) = &values.model {
             self.ignored.push(format!(
                 "model = {model} ignored ({source}): models for pacman-enforced classes come only from the system file"
@@ -221,7 +223,7 @@ mod tests {
     use super::{Layers, Origin, resolve};
     use crate::config::file::PartialPolicy;
     use crate::config::model::{
-        Action, AiRequirement, Named, Profile, SourceClass, Thinking, builtin,
+        Action, AiRequirement, Named, Policy, Profile, SourceClass, Thinking, builtin,
     };
 
     fn layers<'a>(
@@ -304,9 +306,17 @@ mod tests {
             SourceClass::Official,
             &layers(Profile::Standard, &empty, Some(Profile::Strict), &empty),
         );
-        assert_eq!(
-            resolved.policy,
-            builtin(Profile::Strict, SourceClass::Official)
+        let expected = Policy {
+            thinking: Thinking::Low,
+            ..builtin(Profile::Strict, SourceClass::Official)
+        };
+        assert_eq!(resolved.policy, expected);
+        assert_eq!(resolved.origin("thinking"), Origin::Profile);
+        assert!(
+            resolved
+                .ignored
+                .iter()
+                .any(|line| line.starts_with("thinking = medium ignored (user profile strict)"))
         );
 
         let looser = resolve(
@@ -366,10 +376,7 @@ mod tests {
                                             policy.on_ai_suspicious,
                                             system_action.max(user_action)
                                         );
-                                        assert_eq!(
-                                            policy.thinking,
-                                            system_thinking.max(user_thinking)
-                                        );
+                                        assert_eq!(policy.thinking, system_thinking);
                                     }
                                 }
                             }
