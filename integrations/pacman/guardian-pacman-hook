@@ -22,15 +22,24 @@ if [ "$(id -u)" -eq 0 ]; then
         printf '%s\n' "Cannot run the Guardian package review as the invoking user." >&2
         exit 2
     fi
-    GUARDIAN_PACMAN_PID=$pacman_pid
-    GUARDIAN_PACMAN_CWD=$pacman_cwd
-    export GUARDIAN_PACMAN_PID GUARDIAN_PACMAN_CWD
-    # The review runs unprivileged. It still insists on a root-owned OpenCode
-    # binary, because this gate sits in front of a root transaction.
-    exec /usr/bin/runuser --login \
-        --whitelist-environment=GUARDIAN_PACMAN_PID,GUARDIAN_PACMAN_CWD \
-        --command 'exec /usr/bin/omarchy-guardian pacman-hook --pacman-pid "$GUARDIAN_PACMAN_PID" --cwd "$GUARDIAN_PACMAN_CWD"' \
-        "$invoking_user"
+    user_home=$(getent passwd "$invoking_user" | cut -d: -f6)
+    case $user_home in
+        /*) ;;
+        *)
+            printf '%s\n' "Cannot find the home directory of $invoking_user." >&2
+            exit 2
+            ;;
+    esac
+    # The review runs unprivileged and starts from an empty environment
+    # without a login shell, so the user's rc files cannot exit early, change
+    # PATH or export provider variables. OpenCode still reads the user's own
+    # OpenCode config and credentials under HOME. The review insists on a
+    # root-owned OpenCode binary, because this gate sits in front of a root
+    # transaction.
+    exec /usr/bin/runuser -u "$invoking_user" -- /usr/bin/env -i \
+        HOME="$user_home" USER="$invoking_user" LOGNAME="$invoking_user" \
+        PATH=/usr/bin:/bin LANG=C.UTF-8 \
+        "$GUARDIAN" pacman-hook --pacman-pid "$pacman_pid" --cwd "$pacman_cwd"
 fi
 
 # Only reachable when the hook is run without root, which pacman never does;
