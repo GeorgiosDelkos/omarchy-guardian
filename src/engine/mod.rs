@@ -6,3 +6,4 @@
 pub mod diff;
 pub mod plan;
 pub mod request;
+pub mod store;
