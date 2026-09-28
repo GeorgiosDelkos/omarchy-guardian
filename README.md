@@ -29,7 +29,8 @@ omarchy-guardian sandbox ./theme-checkout -- /usr/bin/true
 - `--identity ID` or `--unit DIR ID` (repeatable) on `scan`, `guard` and
   `sandbox` name what is reviewed for the review memory (see
   [How the review scales](#how-the-review-scales)); `omarchy-guardian forget
-  ID` or `forget --all` clears it.
+  ID` drops that source's baselines (cached verdicts are kept) and `forget
+  --all` clears everything.
 
 Exit codes: `0` clear, warned or limited review (a scriptlet-free pacman
 transaction); `1` findings; `2` an incomplete review, an unavailable AI review
@@ -217,8 +218,9 @@ targets), Guardian keeps a review memory in
 
 The AUR gate remembers a build by yay's build directory name, and the theme
 handler remembers a theme by its name. Other targets are remembered by their
-class and path. `omarchy-guardian forget ID` drops one source's baselines;
-`omarchy-guardian forget --all` also clears every cached verdict. `config
+class and path. `omarchy-guardian forget ID` drops one source's baselines
+but keeps cached verdicts, so an unchanged rebuild can still be answered from
+the cache; `omarchy-guardian forget --all` also clears every cached verdict. `config
 show` prints the memory's location and size.
 
 The pacman gate never uses this memory: every scriptlet gets a fresh, full

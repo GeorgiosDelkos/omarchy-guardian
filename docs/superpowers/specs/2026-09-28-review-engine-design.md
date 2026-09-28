@@ -294,6 +294,9 @@ count.
 - `--identity <string>` and `--unit <dir> <string>` on `scan`, `guard` and
   `sandbox` (section 8).
 - `omarchy-guardian forget <identity>` removes that identity's baselines.
+  Cached verdicts are not keyed by identity, so they are kept, and the
+  output says so: "Cached verdicts are kept; use forget --all to clear them
+  too."
 - `omarchy-guardian forget --all` removes every baseline and cached verdict.
 
 ## 11. Errors

@@ -12,6 +12,7 @@ use crate::config::model::{AiRequirement, Named, Profile, SourceClass};
 use crate::config::show;
 use crate::engine::baseline::{self, Identity, Unit};
 use crate::engine::store::Store;
+use crate::error::Error;
 use crate::pacman::{self, HookArgs};
 use crate::report::{Blocked, Decision, Report};
 use crate::review::{self, ReviewContext};
@@ -32,6 +33,8 @@ Usage:
 
 CLASS: aur, theme, plugin, source (default). PROFILE: standard, strict, local-only.
 ID names what is reviewed for the review memory, e.g. aur:yay-bin.
+forget ID drops that source's approved baselines; cached verdicts are kept
+(forget --all clears them too).
 Exit codes: 0 clear or warned, 1 findings, 2 incomplete review, AI unavailable,
 not confirmed, or usage error. guard and sandbox replace these with the
 command's own exit code once it starts.";
@@ -357,7 +360,9 @@ fn parse_forget(args: &[OsString]) -> Result<Forget, String> {
     }
 }
 
-/// Drops approved baselines (and with `--all`, every cached verdict).
+/// Drops approved baselines (and with `--all`, every cached verdict; one
+/// identity's cached verdicts are kept, since verdicts are not keyed by
+/// identity).
 fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
     let Some(root) = root else {
         eprintln!("omarchy-guardian: no state directory (set HOME or XDG_STATE_HOME)");
@@ -374,17 +379,7 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = match forget {
-        Forget::All => baseline::forget_all(&store)
-            .map(|count| format!("Forgot {count} approved baseline(s) and every cached verdict.")),
-        Forget::One(identity) => baseline::forget(&store, identity).map(|count| {
-            format!(
-                "Forgot {count} approved baseline(s) for {}.",
-                identity.as_str()
-            )
-        }),
-    };
-    match result {
+    match forget_in(forget, &store) {
         Ok(message) => {
             println!("{message}");
             ExitCode::SUCCESS
@@ -393,6 +388,20 @@ fn forget_command(forget: &Forget, root: Option<PathBuf>) -> ExitCode {
             eprintln!("omarchy-guardian: {error}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// Forgets what `forget` names in `store`; returns the line to print.
+fn forget_in(forget: &Forget, store: &Store) -> Result<String, Error> {
+    match forget {
+        Forget::All => baseline::forget_all(store)
+            .map(|count| format!("Forgot {count} approved baseline(s) and every cached verdict.")),
+        Forget::One(identity) => baseline::forget(store, identity).map(|count| {
+            format!(
+                "Forgot {count} approved baseline(s) for {}. Cached verdicts are kept; use forget --all to clear them too.",
+                identity.as_str()
+            )
+        }),
     }
 }
 
@@ -625,8 +634,8 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        ConfigCommand, Confirm, Forget, Invocation, Target, forget_command, guard_command, parse,
-        review_and_decide,
+        ConfigCommand, Confirm, Forget, Invocation, Target, forget_command, forget_in,
+        guard_command, parse, review_and_decide,
     };
     use crate::agent::SourceFile;
     use crate::config::Settings;
@@ -1047,6 +1056,10 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            forget_in(&Forget::One(unit.identity.clone()), &store).unwrap(),
+            "Forgot 1 approved baseline(s) for aur:demo. Cached verdicts are kept; use forget --all to clear them too."
+        );
         assert_eq!(
             forget_command(&Forget::One(unit.identity.clone()), Some(root.clone())),
             ExitCode::SUCCESS
