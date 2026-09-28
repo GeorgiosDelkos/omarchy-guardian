@@ -182,11 +182,12 @@ Large sources are reviewed in several AI calls (chunks) instead of being
 refused. Files are ranked by risk:
 
 1. Build and install entry points go first and are always sent whole:
-   `PKGBUILD`, `.install`, `Makefile`, top-level `*.sh`, systemd units,
-   `.desktop` files, Hyprland `exec` config, plugin QML, and any file with a
-   local finding.
+   `PKGBUILD`, `.install`, `Makefile`, `GNUmakefile`, `CMakeLists.txt`,
+   `meson.build`, `build.rs`, `setup.py`, `pyproject.toml`, `package.json`,
+   top-level `*.sh`, systemd units, `.desktop` files, Hyprland `exec`
+   config, plugin QML, and any file with a local finding.
 2. Other code and runtime config follow.
-3. Documentation goes last.
+3. Everything else, with documentation last.
 
 Each chunk is its own OpenCode run with its own nonce, and every chunk carries
 the full file list, so the model knows what else exists. A source that needs
