@@ -151,6 +151,9 @@ The trusted part of the request, written by Guardian, adds:
 
 - the source class, and "first review" or "upgrade of an approved version";
 - "chunk k of n" and the manifest;
+- that files listed as unchanged (already approved) or reviewed in other
+  chunks are not by themselves grounds for `inconclusive`: the model judges
+  the content it was given (`PROMPT_VERSION` 3);
 - an Omarchy checklist of what to look for:
   - autostart: Hyprland `exec` / `exec-once`, `~/.config/systemd/user`,
     `~/.config/autostart`;
