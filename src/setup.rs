@@ -516,11 +516,29 @@ fn write_temporary(path: &Path, text: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Creates the directory explicitly with 0755: `install -D` would create it
+/// with sudo's umask, and a 0700 directory hides the file from the pacman
+/// hook, which runs as the user and would then block every transaction.
 fn install_system_file(temporary: &Path) -> Result<(), String> {
+    let directory = Path::new(SYSTEM_PATH)
+        .parent()
+        .ok_or("invalid system config path")?;
+
+    sudo_install(
+        &["-d", "-m", "0755", "-o", "root", "-g", "root"],
+        &[directory],
+    )?;
+    sudo_install(
+        &["-m", "0644", "-o", "root", "-g", "root"],
+        &[temporary, Path::new(SYSTEM_PATH)],
+    )
+}
+
+fn sudo_install(flags: &[&str], paths: &[&Path]) -> Result<(), String> {
     let status = Command::new("/usr/bin/sudo")
-        .args(["install", "-D", "-m", "0644", "-o", "root", "-g", "root"])
-        .arg(temporary)
-        .arg(SYSTEM_PATH)
+        .arg("install")
+        .args(flags)
+        .args(paths)
         .status()
         .map_err(|error| error.to_string())?;
     if status.success() {
