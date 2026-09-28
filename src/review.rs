@@ -5,6 +5,7 @@ use crate::agent::{self, AgentError, SourceFile};
 use crate::config::Settings;
 use crate::config::model::{AgentSettings, AiRequirement, Named, SourceClass};
 use crate::deps;
+use crate::engine::request::Request;
 use crate::osv;
 use crate::report::{AgentOutcome, AgentRun, Gap, LocalFinding, NetworkRequest, Report};
 use crate::rules::{self, RuleId, Scheme};
@@ -184,14 +185,21 @@ pub fn run_agents(report: &mut Report, settings: &Settings, opencode: &OpenCode)
     for (agent_settings, files) in groups {
         let outcome = match opencode.resolve() {
             Err(error) => AgentOutcome::Unavailable(error),
-            Ok(binary) => match agent::review(&binary, &files, &agent_settings) {
-                Ok(review) => AgentOutcome::Reviewed(review),
-                Err(AgentError::Unavailable(error)) => AgentOutcome::Unavailable(error),
-                Err(AgentError::Invalid(error)) => {
-                    report.gaps.push(Gap::Agent(error));
-                    continue;
+            Ok(binary) => {
+                let request = Request::for_files(report.class, &files);
+                match agent::review(
+                    &binary,
+                    &|nonce: &str| request.render(nonce),
+                    &agent_settings,
+                ) {
+                    Ok(review) => AgentOutcome::Reviewed(review),
+                    Err(AgentError::Unavailable(error)) => AgentOutcome::Unavailable(error),
+                    Err(AgentError::Invalid(error)) => {
+                        report.gaps.push(Gap::Agent(error));
+                        continue;
+                    }
                 }
-            },
+            }
         };
         report.agent_runs.push(AgentRun {
             files: files.into_iter().map(|file| file.path).collect(),
