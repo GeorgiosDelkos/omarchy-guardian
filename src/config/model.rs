@@ -215,14 +215,15 @@ impl Default for AgentSettings {
 }
 
 impl AgentSettings {
-    /// `model · thinking`, shown next to every AI verdict.
+    /// `model · thinking`, shown next to every AI verdict. A level without a
+    /// variant is marked, because OpenCode never received it.
     pub fn label(&self) -> String {
         let model = self.model.as_deref().unwrap_or("default model");
-        let thinking = match self.thinking {
-            Thinking::Default => "default thinking",
-            other => other.name(),
-        };
-        format!("{model} · {thinking}")
+        match (self.thinking, &self.variant) {
+            (Thinking::Default, _) => format!("{model} · default thinking"),
+            (level, Some(_)) => format!("{model} · {}", level.name()),
+            (level, None) => format!("{model} · {} (provider default)", level.name()),
+        }
     }
 }
 
@@ -342,6 +343,11 @@ mod tests {
         assert_eq!(settings.label(), "default model · default thinking");
         settings.model = Some("anthropic/claude-sonnet-5".into());
         settings.thinking = Thinking::High;
+        assert_eq!(
+            settings.label(),
+            "anthropic/claude-sonnet-5 · high (provider default)"
+        );
+        settings.variant = Some("high".into());
         assert_eq!(settings.label(), "anthropic/claude-sonnet-5 · high");
     }
 }

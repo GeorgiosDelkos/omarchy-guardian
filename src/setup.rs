@@ -61,6 +61,14 @@ fn render(choice: &Choice, classes: &[SourceClass], official_model: bool) -> Str
         // Formatting into a String cannot fail.
         let _ = write!(text, "\n[agent]\nmodel = \"{model}\"\n");
     }
+    if let Some(level) = tested_variant(choice) {
+        let _ = write!(
+            text,
+            "\n[agent.variants]\n{} = \"{}\"\n",
+            level.name(),
+            level.name()
+        );
+    }
     if official_model && let Some(model) = &choice.official_model {
         let _ = write!(text, "\n[class.official]\nmodel = \"{model}\"\n");
     }
@@ -75,6 +83,14 @@ fn render(choice: &Choice, classes: &[SourceClass], official_model: bool) -> Str
         }
     }
     text
+}
+
+/// The level the test run sent as `--variant`. Variant names are
+/// provider-specific, so only this one is mapped: any other level stays on
+/// the provider default rather than risk a rejected variant.
+fn tested_variant(choice: &Choice) -> Option<Thinking> {
+    (choice.profile != Profile::LocalOnly && choice.thinking != Thinking::Default)
+        .then_some(choice.thinking)
 }
 
 pub fn render_user(choice: &Choice) -> String {
@@ -237,8 +253,7 @@ fn tune_agent(
         let settings = AgentSettings {
             model: choice.model.clone(),
             thinking: choice.thinking,
-            variant: (choice.thinking != Thinking::Default)
-                .then(|| choice.thinking.name().to_string()),
+            variant: tested_variant(choice).map(|level| level.name().to_string()),
             timeout_secs: 300,
             ..AgentSettings::default()
         };
@@ -259,8 +274,8 @@ fn tune_agent(
     }
 }
 
-/// Renders both files, parses them back and requires the parsed model
-/// fields to exactly match what was selected. A model name containing `"`
+/// Renders both files, parses them back and requires the parsed model and
+/// variant fields to exactly match what was selected. A model name containing `"`
 /// or `\` would otherwise still parse (for example truncated at the quote,
 /// with the rest read as a comment) as a *different*, unintended model
 /// instead of failing loudly.
@@ -272,8 +287,15 @@ fn validate_rendered(choice: &Choice) -> Result<(String, String), String> {
     let system_config =
         parse(Path::new("system config"), &system_text).map_err(|error| error.to_string())?;
 
+    let variants: Vec<(Thinking, String)> = tested_variant(choice)
+        .map(|level| (level, level.name().to_string()))
+        .into_iter()
+        .collect();
+
     let matches = user_config.agent.model == choice.model
         && system_config.agent.model == choice.model
+        && user_config.agent.variants == variants
+        && system_config.agent.variants == variants
         && system_config.class(SourceClass::Official).model == choice.official_model;
     if matches {
         Ok((user_text, system_text))
@@ -620,6 +642,14 @@ mod tests {
         );
         assert!(terminal.output.contains("root-owned"));
         assert_eq!(environment.tested.borrow()[0].thinking, Thinking::High);
+        assert_eq!(
+            environment.tested.borrow()[0].variant.as_deref(),
+            Some("high")
+        );
+
+        let tested = vec![(Thinking::High, "high".to_string())];
+        assert_eq!(user_config.agent.variants, tested);
+        assert_eq!(system_config.agent.variants, tested);
     }
 
     #[test]
@@ -648,6 +678,27 @@ mod tests {
         assert!(environment.tested.borrow().is_empty());
         let user = environment.user_written.borrow().clone().unwrap();
         assert!(user.contains("profile = \"local-only\""));
+        assert!(!user.contains("[agent.variants]"));
+    }
+
+    #[test]
+    fn default_thinking_is_tested_and_written_without_a_variant() {
+        let environment = Fake {
+            opencode: true,
+            test_passes: true,
+            ..Fake::default()
+        };
+        // profile (default), model (default), official model (default),
+        // thinking 1 = default, confirm the system write
+        let mut terminal = script(&["", "", "", "1", "y"]);
+
+        run(&mut terminal, &environment).unwrap();
+
+        assert_eq!(environment.tested.borrow()[0].variant, None);
+        let user = environment.user_written.borrow().clone().unwrap();
+        let system = environment.system_written.borrow().clone().unwrap();
+        assert!(!user.contains("[agent.variants]"));
+        assert!(!system.contains("[agent.variants]"));
     }
 
     #[test]

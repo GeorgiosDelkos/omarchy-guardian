@@ -144,7 +144,9 @@ mod tests {
         assert!(text.contains("[aur]"));
         assert!(text.contains("thinking          max               (user)"));
         assert!(
-            text.contains("agent             default model · max · timeout 300s · input 256 KiB")
+            text.contains(
+                "agent             default model · max (provider default) · timeout 300s · input 256 KiB"
+            )
         );
     }
 

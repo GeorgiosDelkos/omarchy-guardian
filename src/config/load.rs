@@ -7,9 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::config::file::{AgentDefaults, PartialConfig, parse};
-use crate::config::model::{
-    AgentSettings, DEFAULT_MAX_INPUT_KIB, Named, Policy, Profile, SourceClass, Thinking,
-};
+use crate::config::model::{AgentSettings, DEFAULT_MAX_INPUT_KIB, Policy, Profile, SourceClass};
 use crate::config::resolve::{Layers, Resolved, resolve};
 
 pub const SYSTEM_PATH: &str = "/etc/omarchy-guardian/config.toml";
@@ -243,18 +241,14 @@ impl Settings {
             .model
             .clone()
             .or_else(|| layers.iter().rev().find_map(|layer| layer.model.clone()));
-        let variant = (policy.thinking != Thinking::Default).then(|| {
-            layers
+        // Variant names are provider-specific, so a level is only sent when
+        // `[agent.variants]` maps it; otherwise the provider default applies.
+        let variant = layers.iter().rev().find_map(|layer| {
+            layer
+                .variants
                 .iter()
-                .rev()
-                .find_map(|layer| {
-                    layer
-                        .variants
-                        .iter()
-                        .find(|(level, _)| *level == policy.thinking)
-                        .map(|(_, name)| name.clone())
-                })
-                .unwrap_or_else(|| policy.thinking.name().to_string())
+                .find(|(level, _)| *level == policy.thinking)
+                .map(|(_, name)| name.clone())
         });
         let max_input_kib = layers
             .iter()
@@ -422,7 +416,11 @@ mod tests {
 
         let official = settings.agent_settings(SourceClass::Official);
         assert_eq!(official.model.as_deref(), Some("anthropic/claude-sonnet-5"));
-        assert_eq!(official.variant.as_deref(), Some("low"));
+        assert_eq!(official.variant, None);
+        assert_eq!(
+            official.label(),
+            "anthropic/claude-sonnet-5 · low (provider default)"
+        );
         assert_eq!(official.max_input_bytes, 512 * 1024);
 
         let aur = settings.agent_settings(SourceClass::Aur);
@@ -432,6 +430,9 @@ mod tests {
 
         let theme = settings.agent_settings(SourceClass::Theme);
         assert_eq!(theme.variant.as_deref(), Some("deep"));
+
+        let unmapped = Settings::from_parts(PartialConfig::default(), PartialConfig::default());
+        assert_eq!(unmapped.agent_settings(SourceClass::Aur).variant, None);
     }
 
     #[test]

@@ -185,8 +185,11 @@ them).
 
 ## 7. Agent settings
 
-- `thinking` other than `default` is passed as `--variant <name>`, where `name`
-  is the `[agent.variants]` mapping if present, else the level name.
+- `thinking` is passed as `--variant <name>` only when `[agent.variants]` maps
+  the level (system file for privileged classes; system then user file
+  otherwise), because variant names are provider-specific. An unmapped level
+  sends no variant and is shown as `<level> (provider default)`. The setup
+  wizard maps the level it tested (`<level> = "<level>"`) in both files.
 - `model` (class override, else `[agent] model`) is passed as `--model`.
 - `max_input_kib` replaces the fixed 256 KiB limit.
 - A rejected model or variant is AI unavailable, with the setting named in the
